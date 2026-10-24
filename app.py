@@ -123,6 +123,33 @@ with tabs[1]:
                 if path:
                     try: st.image(sb.storage.from_("disques-photos").create_signed_url(path,3600)["signedURL"], caption=caption, width=300)
                     except Exception: pass
+            with st.expander("✏️ Modifier cette fiche"):
+                with st.form("edit_record_form"):
+                    edit_vals = {}
+                    left, right = st.columns(2)
+                    for i, field_name in enumerate(fields):
+                        with (left if i < 7 else right):
+                            current = str(chosen.get(field_name) or "")
+                            if field_name in ("notes", "identification_ia"):
+                                edit_vals[field_name] = st.text_area(field_name.replace("_", " ").capitalize(), value=current, height=80, key="edit_" + field_name)
+                            else:
+                                edit_vals[field_name] = st.text_input(field_name.replace("_", " ").capitalize(), value=current, key="edit_" + field_name)
+                    etats_edit = ["Très bon état", "Bon état", "État moyen", "Abîmé"]
+                    etat_actuel = chosen.get("etat") or "Très bon état"
+                    edit_etat = st.selectbox("État du disque", etats_edit, index=etats_edit.index(etat_actuel) if etat_actuel in etats_edit else 0)
+                    pochettes_edit = ["Oui", "Non", "À confirmer"]
+                    pochette_actuelle = chosen.get("pochette") or "À confirmer"
+                    edit_pochette = st.radio("Pochette présente ?", pochettes_edit, index=pochettes_edit.index(pochette_actuelle) if pochette_actuelle in pochettes_edit else 2, horizontal=True)
+                    save_edit = st.form_submit_button("Enregistrer les modifications", type="primary")
+                if save_edit:
+                    try:
+                        edit_vals["etat"] = edit_etat
+                        edit_vals["pochette"] = edit_pochette
+                        sb.table("disques").update(edit_vals).eq("id", chosen["id"]).execute()
+                        st.success("Modifications enregistrées.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Modification impossible : {e}")
             with st.expander("Supprimer cette fiche"):
                 st.warning("Cette action est définitive.")
                 if st.button("Confirmer la suppression", key="del"):
