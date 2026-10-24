@@ -2,7 +2,7 @@ import base64, io, json, uuid
 from datetime import datetime
 import pandas as pd
 import streamlit as st
-from openai import OpenAI
+import requests
 from PIL import Image
 from supabase import create_client
 
@@ -37,21 +37,27 @@ except Exception as e:
     st.code(str(e)); st.stop()
 
 st.title("💿 Ma collection de disques 78 tours")
-st.caption("Les photos et les fiches sont conservées dans Supabase.")
-api_key = secret("openai","api_key")
+st.caption("Les photos et les fiches sont conservées dans Supabase. L’identification utilise Gemini, avec un quota gratuit limité.")
+api_key = secret("gemini","api_key")
 
 def jpg_bytes(upload):
     im = Image.open(upload).convert("RGB"); im.thumbnail((1800,1800))
     b = io.BytesIO(); im.save(b, "JPEG", quality=88); return b.getvalue()
 
 def identify(upload):
+    if not api_key:
+        raise ValueError("Clé Gemini manquante dans les Secrets Streamlit ([gemini] api_key).")
     raw = jpg_bytes(upload)
-    data = "data:image/jpeg;base64," + base64.b64encode(raw).decode()
-    prompt = """Lis cette étiquette de disque 78 tours. Ne devine pas les éléments illisibles. Donne une estimation indicative de revente en euros pour un disque en très bon état, pas une cote garantie. Réponds uniquement en JSON avec les champs: titre_face_a, titre_face_b, interprete_face_a, interprete_face_b, orchestre, auteurs, label_marque, reference_disque, annee, estimation_basse_eur, estimation_haute_eur, notes, identification_ia."""
-    res = OpenAI(api_key=api_key).responses.create(model="gpt-4.1-mini", input=[{"role":"user","content":[{"type":"input_text","text":prompt},{"type":"input_image","image_url":data}]}], max_output_tokens=1000)
-    txt = res.output_text.strip()
-    if txt.startswith("```"): txt = txt.split("\n",1)[1].rsplit("```",1)[0].strip()
-    return json.loads(txt)
+    prompt = """Lis cette étiquette de disque 78 tours. Transcris fidèlement les éléments visibles et ne devine pas les éléments illisibles. Donne une estimation indicative de revente en euros, sans présenter cela comme une cote garantie. Réponds uniquement en JSON avec les champs: titre_face_a, titre_face_b, interprete_face_a, interprete_face_b, orchestre, auteurs, label_marque, reference_disque, annee, estimation_basse_eur, estimation_haute_eur, notes, identification_ia."""
+    response = requests.post("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent", params={"key": api_key}, json={"contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(raw).decode("ascii")}}]}], "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}}, timeout=90)
+    if response.status_code >= 400:
+        try: detail = response.json().get("error", {}).get("message", response.text)
+        except Exception: detail = response.text
+        raise RuntimeError(f"Gemini API ({response.status_code}) : {detail}")
+    try:
+        return json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
+        raise RuntimeError("Gemini n'a pas renvoyé de réponse JSON exploitable. Réessayez avec une photo plus nette.") from e
 
 tabs = st.tabs(["➕ Ajouter un disque", "📚 Catalogue", "⬇️ Exporter"])
 fields = ["titre_face_a","interprete_face_a","titre_face_b","interprete_face_b","orchestre","auteurs","label_marque","reference_disque","annee","estimation_basse_eur","estimation_haute_eur","notes","identification_ia"]
@@ -63,7 +69,7 @@ with tabs[0]:
     cover = st.radio("Pochette présente ?", ["Oui","Non","À confirmer"], horizontal=True)
     if label_photo:
         st.image(label_photo, width=300)
-        if st.button("🔎 Interroger l'IA à partir de la photo", type="primary", disabled=not api_key):
+        if st.button("🔎 Identifier gratuitement avec Gemini", type="primary", disabled=not api_key):
             try:
                 with st.spinner("Analyse de l'étiquette…"): st.session_state.ai_result = identify(label_photo)
             except Exception as e: st.error(f"Erreur IA : {e}")
