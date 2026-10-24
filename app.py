@@ -49,7 +49,7 @@ def identify(upload):
         raise ValueError("Clé Gemini manquante dans les Secrets Streamlit ([gemini] api_key).")
     raw = jpg_bytes(upload)
     prompt = """Lis cette étiquette de disque 78 tours. Transcris fidèlement les éléments visibles et ne devine pas les éléments illisibles. Donne une estimation indicative de revente en euros, sans présenter cela comme une cote garantie. Réponds uniquement en JSON avec les champs: titre_face_a, titre_face_b, interprete_face_a, interprete_face_b, orchestre, auteurs, label_marque, reference_disque, annee, estimation_basse_eur, estimation_haute_eur, notes, identification_ia."""
-    response = requests.post("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent", params={"key": api_key}, json={"contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(raw).decode("ascii")}}]}], "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}}, timeout=90)
+    response = requests.post("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent", params={"key": api_key}, json={"contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(raw).decode("ascii")}}]}], "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}}, timeout=90)
     if response.status_code >= 400:
         try: detail = response.json().get("error", {}).get("message", response.text)
         except Exception: detail = response.text
