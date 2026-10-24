@@ -70,7 +70,7 @@ def identify(upload):
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
         raise RuntimeError("Gemini n'a pas renvoyé de réponse JSON exploitable. Réessayez avec une photo plus nette.") from e
 
-tabs = st.tabs(["➕ Ajouter un disque", "📚 Catalogue", "⬇️ Exporter"])
+tabs = st.tabs(["➕ Ajouter un disque", "📚 Catalogue", "⬇️ Exporter", "📊 État récapitulatif"])
 fields = ["titre_face_a","interprete_face_a","titre_face_b","interprete_face_b","orchestre","auteurs","label_marque","reference_disque","annee","estimation_basse_eur","estimation_haute_eur","notes","identification_ia"]
 with tabs[0]:
     c1,c2 = st.columns(2)
@@ -137,3 +137,55 @@ with tabs[2]:
         df = pd.DataFrame(records).fillna("")
         st.download_button("Télécharger le catalogue CSV pour Excel", df.to_csv(index=False).encode("utf-8-sig"), "ma_collection_78_tours.csv", "text/csv")
     else: st.info("Ajoutez un disque pour commencer.")
+
+with tabs[3]:
+    st.subheader("État récapitulatif de la collection")
+    if not records:
+        st.info("Aucun disque enregistré : le récapitulatif apparaîtra dès le premier ajout.")
+    else:
+        recap = pd.DataFrame(records).fillna("")
+        def euro_number(value):
+            if value is None: return None
+            s = str(value).strip().replace("€", "").replace(" ", "").replace(",", ".")
+            try: return float(s) if s else None
+            except (TypeError, ValueError): return None
+
+        for col in ["estimation_basse_eur", "estimation_haute_eur"]:
+            if col not in recap.columns:
+                recap[col] = None
+            recap[col + "_num"] = recap[col].apply(euro_number)
+        total = len(recap)
+        basse = recap["estimation_basse_eur_num"].sum(min_count=1)
+        haute = recap["estimation_haute_eur_num"].sum(min_count=1)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Nombre de disques", total)
+        c2.metric("Valeur estimée basse", "Non renseignée" if pd.isna(basse) else f"{basse:,.0f} €".replace(",", " "))
+        c3.metric("Valeur estimée haute", "Non renseignée" if pd.isna(haute) else f"{haute:,.0f} €".replace(",", " "))
+        st.caption("Les montants sont des estimations indicatives saisies ou proposées par l’IA, et non une expertise ni une garantie de prix de vente.")
+
+        st.markdown("#### État des disques")
+        etats = recap["etat"].replace("", "Non renseigné").value_counts().rename_axis("État").reset_index(name="Nombre")
+        st.dataframe(etats, use_container_width=True, hide_index=True)
+
+        st.markdown("#### Présence des pochettes")
+        pochettes = recap["pochette"].replace("", "À confirmer").value_counts().rename_axis("Pochette").reset_index(name="Nombre")
+        st.dataframe(pochettes, use_container_width=True, hide_index=True)
+
+        st.markdown("#### Répartition par marque / label")
+        marques = recap["label_marque"].replace("", "Non renseigné").value_counts().rename_axis("Marque / label").reset_index(name="Nombre")
+        st.dataframe(marques, use_container_width=True, hide_index=True)
+
+        st.markdown("#### Répartition par décennie")
+        annees = pd.to_numeric(recap.get("annee", pd.Series(index=recap.index, dtype="object")).astype(str).str.extract(r"(\\d{4})", expand=False), errors="coerce")
+        decades = (annees // 10 * 10).dropna().astype(int).astype(str) + "s"
+        if len(decades):
+            decade_counts = decades.value_counts().sort_index().rename_axis("Décennie").reset_index(name="Nombre")
+            st.dataframe(decade_counts, use_container_width=True, hide_index=True)
+        else:
+            st.info("Les années ne sont pas encore renseignées pour les disques.")
+
+        st.markdown("#### Liste récapitulative")
+        display_cols = ["titre_face_a", "interprete_face_a", "titre_face_b", "interprete_face_b", "label_marque", "reference_disque", "annee", "etat", "pochette", "estimation_basse_eur", "estimation_haute_eur"]
+        summary = recap[[col for col in display_cols if col in recap.columns]].copy()
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+        st.download_button("Télécharger l’état récapitulatif (CSV pour Excel)", summary.to_csv(index=False).encode("utf-8-sig"), "etat_recapitulatif_78_tours.csv", "text/csv")
