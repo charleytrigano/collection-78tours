@@ -41,15 +41,26 @@ st.caption("Les photos et les fiches sont conservées dans Supabase. L’identif
 api_key = secret("gemini","api_key")
 
 def jpg_bytes(upload):
-    im = Image.open(upload).convert("RGB"); im.thumbnail((1800,1800))
-    b = io.BytesIO(); im.save(b, "JPEG", quality=88); return b.getvalue()
+    im = Image.open(upload).convert("RGB"); im.thumbnail((1200,1200))
+    b = io.BytesIO(); im.save(b, "JPEG", quality=78, optimize=True); return b.getvalue()
 
 def identify(upload):
     if not api_key:
         raise ValueError("Clé Gemini manquante dans les Secrets Streamlit ([gemini] api_key).")
     raw = jpg_bytes(upload)
     prompt = """Lis cette étiquette de disque 78 tours. Transcris fidèlement les éléments visibles et ne devine pas les éléments illisibles. Donne une estimation indicative de revente en euros, sans présenter cela comme une cote garantie. Réponds uniquement en JSON avec les champs: titre_face_a, titre_face_b, interprete_face_a, interprete_face_b, orchestre, auteurs, label_marque, reference_disque, annee, estimation_basse_eur, estimation_haute_eur, notes, identification_ia."""
-    response = requests.post("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent", params={"key": api_key}, json={"contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(raw).decode("ascii")}}]}], "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}}, timeout=90)
+    payload = {"contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(raw).decode("ascii")}}]}], "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}}
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
+    # Une seconde tentative peut suffire en cas de lenteur temporaire du service.
+    last_error = None
+    for attempt in range(2):
+        try:
+            response = requests.post(url, params={"key": api_key}, json=payload, timeout=(15, 180))
+            break
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_error = e
+            if attempt == 1:
+                raise RuntimeError("Gemini ne répond toujours pas après deux tentatives. Attendez une minute puis réessayez, idéalement avec une photo plus rapprochée et nette.") from last_error
     if response.status_code >= 400:
         try: detail = response.json().get("error", {}).get("message", response.text)
         except Exception: detail = response.text
