@@ -1,0 +1,122 @@
+import base64, io, json, uuid
+from datetime import datetime
+import pandas as pd
+import streamlit as st
+from openai import OpenAI
+from PIL import Image
+from supabase import create_client
+
+st.set_page_config(page_title="Ma collection de 78 tours", page_icon="💿", layout="wide")
+
+def secret(section, key):
+    try: return st.secrets[section][key]
+    except Exception: return ""
+
+password = secret("app", "password")
+if not password:
+    st.error("Configuration manquante : ajoutez [app] password dans les Secrets Streamlit.")
+    st.stop()
+if not st.session_state.get("auth_ok"):
+    st.title("💿 Ma collection de disques 78 tours")
+    entered = st.text_input("Mot de passe", type="password")
+    if st.button("Se connecter", type="primary"):
+        if entered == password:
+            st.session_state.auth_ok = True
+            st.rerun()
+        st.error("Mot de passe incorrect.")
+    st.stop()
+
+@st.cache_resource
+def db():
+    return create_client(secret("supabase","url"), secret("supabase","service_role_key"))
+try:
+    sb = db()
+    records = sb.table("disques").select("*").order("created_at", desc=True).execute().data or []
+except Exception as e:
+    st.error("Connexion Supabase impossible. Vérifiez les Secrets et exécutez supabase_schema.sql.")
+    st.code(str(e)); st.stop()
+
+st.title("💿 Ma collection de disques 78 tours")
+st.caption("Les photos et les fiches sont conservées dans Supabase.")
+api_key = secret("openai","api_key")
+
+def jpg_bytes(upload):
+    im = Image.open(upload).convert("RGB"); im.thumbnail((1800,1800))
+    b = io.BytesIO(); im.save(b, "JPEG", quality=88); return b.getvalue()
+
+def identify(upload):
+    raw = jpg_bytes(upload)
+    data = "data:image/jpeg;base64," + base64.b64encode(raw).decode()
+    prompt = """Lis cette étiquette de disque 78 tours. Ne devine pas les éléments illisibles. Donne une estimation indicative de revente en euros pour un disque en très bon état, pas une cote garantie. Réponds uniquement en JSON avec les champs: titre_face_a, titre_face_b, interprete_face_a, interprete_face_b, orchestre, auteurs, label_marque, reference_disque, annee, estimation_basse_eur, estimation_haute_eur, notes, identification_ia."""
+    res = OpenAI(api_key=api_key).responses.create(model="gpt-4.1-mini", input=[{"role":"user","content":[{"type":"input_text","text":prompt},{"type":"input_image","image_url":data}]}], max_output_tokens=1000)
+    txt = res.output_text.strip()
+    if txt.startswith("```"): txt = txt.split("\n",1)[1].rsplit("```",1)[0].strip()
+    return json.loads(txt)
+
+tabs = st.tabs(["➕ Ajouter un disque", "📚 Catalogue", "⬇️ Exporter"])
+fields = ["titre_face_a","interprete_face_a","titre_face_b","interprete_face_b","orchestre","auteurs","label_marque","reference_disque","annee","estimation_basse_eur","estimation_haute_eur","notes","identification_ia"]
+with tabs[0]:
+    c1,c2 = st.columns(2)
+    with c1: label_photo = st.file_uploader("Photo nette de l'étiquette", type=["jpg","jpeg","png","webp"], key="label")
+    with c2: cover_photo = st.file_uploader("Photo de la pochette (facultatif)", type=["jpg","jpeg","png","webp"], key="cover")
+    state = st.selectbox("État", ["Très bon état","Bon état","État moyen","Abîmé"])
+    cover = st.radio("Pochette présente ?", ["Oui","Non","À confirmer"], horizontal=True)
+    if label_photo:
+        st.image(label_photo, width=300)
+        if st.button("🔎 Interroger l'IA à partir de la photo", type="primary", disabled=not api_key):
+            try:
+                with st.spinner("Analyse de l'étiquette…"): st.session_state.ai_result = identify(label_photo)
+            except Exception as e: st.error(f"Erreur IA : {e}")
+    result = st.session_state.get("ai_result", {})
+    with st.form("new_record"):
+        st.subheader("Vérifiez les informations avant l'enregistrement")
+        vals = {}
+        a,b = st.columns(2)
+        for i,f in enumerate(fields):
+            with (a if i < 7 else b):
+                default = str(result.get(f,"") or "")
+                vals[f] = st.text_area(f.replace("_"," ").capitalize(), value=default, height=70 if f in ("notes","identification_ia") else 40) if f in ("notes","identification_ia") else st.text_input(f.replace("_"," ").capitalize(), value=default)
+        if st.form_submit_button("Enregistrer le disque", type="primary"):
+            if not label_photo: st.error("Ajoutez une photo d'étiquette.")
+            else:
+                try:
+                    did = str(uuid.uuid4())
+                    p1 = f"{did}/etiquette.jpg"; sb.storage.from_("disques-photos").upload(p1, jpg_bytes(label_photo), {"content-type":"image/jpeg","upsert":"true"})
+                    p2 = None
+                    if cover_photo:
+                        p2 = f"{did}/pochette.jpg"; sb.storage.from_("disques-photos").upload(p2, jpg_bytes(cover_photo), {"content-type":"image/jpeg","upsert":"true"})
+                    payload = {"id":did, "created_at":datetime.now().astimezone().isoformat(), **vals, "etat":state, "pochette":cover, "photo_etiquette":p1, "photo_pochette":p2}
+                    sb.table("disques").insert(payload).execute()
+                    st.session_state.pop("ai_result",None); st.success("Disque enregistré."); st.rerun()
+                except Exception as e: st.error(f"Enregistrement impossible : {e}")
+with tabs[1]:
+    if records:
+        df = pd.DataFrame(records).fillna("")
+        q = st.text_input("Rechercher un titre, interprète, orchestre, auteur ou référence")
+        if q: df = df[df.astype(str).apply(lambda c:c.str.contains(q,case=False,na=False)).any(axis=1)]
+        cols = ["titre_face_a","titre_face_b","interprete_face_a","interprete_face_b","orchestre","auteurs","label_marque","reference_disque","annee","etat","pochette","estimation_basse_eur","estimation_haute_eur"]
+        st.dataframe(df[[c for c in cols if c in df.columns]], use_container_width=True, hide_index=True)
+        options = df.to_dict("records")
+        if options:
+            chosen = st.selectbox("Détail du disque", options, format_func=lambda r:f"{r.get('titre_face_a') or 'Titre inconnu'} — {r.get('interprete_face_a') or 'Interprète inconnu'}", key="chosen")
+            for f in fields + ["etat","pochette"]:
+                st.write(f"**{f.replace('_',' ').capitalize()} :** {chosen.get(f) or '—'}")
+            for key,caption in [("photo_etiquette","Étiquette"),("photo_pochette","Pochette")]:
+                path = chosen.get(key)
+                if path:
+                    try: st.image(sb.storage.from_("disques-photos").create_signed_url(path,3600)["signedURL"], caption=caption, width=300)
+                    except Exception: pass
+            with st.expander("Supprimer cette fiche"):
+                st.warning("Cette action est définitive.")
+                if st.button("Confirmer la suppression", key="del"):
+                    for path in [chosen.get("photo_etiquette"),chosen.get("photo_pochette")]:
+                        if path:
+                            try: sb.storage.from_("disques-photos").remove([path])
+                            except Exception: pass
+                    sb.table("disques").delete().eq("id",chosen["id"]).execute(); st.rerun()
+    else: st.info("Aucun disque enregistré.")
+with tabs[2]:
+    if records:
+        df = pd.DataFrame(records).fillna("")
+        st.download_button("Télécharger le catalogue CSV pour Excel", df.to_csv(index=False).encode("utf-8-sig"), "ma_collection_78_tours.csv", "text/csv")
+    else: st.info("Ajoutez un disque pour commencer.")
