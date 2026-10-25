@@ -5,8 +5,11 @@ COLLECTION 78 TOURS — DÉPLOIEMENT
 - Ouvrez SQL Editor, collez le contenu de supabase_schema.sql, cliquez Run.
 - Dans Project Settings > API, copiez Project URL et la clé service_role (secret).
 
-2. GROQ (identification des étiquettes par IA)
-- Créez une clé API sur https://console.groq.com/keys
+2. IA (lecture des étiquettes) — au moins une des deux
+- GEMINI (recommandé, bien meilleur pour lire les étiquettes anciennes ; offre gratuite) :
+  créez une clé sur https://aistudio.google.com/apikey
+- GROQ : créez une clé sur https://console.groq.com/keys
+- Si les deux clés sont présentes, un bouton permet de choisir l'IA à chaque analyse.
 - Sans clé, l'application fonctionne quand même : la fiche se saisit à la main.
 
 3. STREAMLIT CLOUD
@@ -17,9 +20,13 @@ COLLECTION 78 TOURS — DÉPLOIEMENT
 url = "https://VOTRE-PROJET.supabase.co"
 service_role_key = "VOTRE_CLE_SERVICE_ROLE"
 
+[gemini]
+api_key = "VOTRE_CLE_API_GEMINI"
+# model = "gemini-3.8-flash"
+
 [groq]
 api_key = "VOTRE_CLE_API_GROQ"
-# Facultatif : autre modèle vision Groq si celui par défaut n'est plus disponible
+# Facultatif (les lignes model) : changer de modèle si celui par défaut n'est plus disponible
 # model = "qwen/qwen3.8-27b"
 
 [app]

@@ -1,4 +1,4 @@
-import base64, hmac, io, json, re, time, uuid
+import base64, hmac, io, json, re, time, unicodedata, uuid
 from datetime import datetime
 
 import pandas as pd
@@ -56,8 +56,6 @@ if not st.session_state.get("auth_ok"):
         st.error("Mot de passe incorrect.")
     st.stop()
 
-GROQ_KEY = secret("groq", "api_key")
-GROQ_MODEL = secret("groq", "model", "qwen/qwen3.8-27b")
 
 
 @st.cache_resource
@@ -85,11 +83,11 @@ except Exception as e:
 
 
 # ---------------------------------------------------------------- Utilitaires
-def jpg_bytes(upload):
+def jpg_bytes(upload, size=1600):
     """Convertit une photo en JPEG redressé (orientation EXIF des téléphones) et réduit."""
     im = Image.open(io.BytesIO(upload.getvalue()))
     im = ImageOps.exif_transpose(im).convert("RGB")
-    im.thumbnail((1600, 1600))
+    im.thumbnail((size, size))
     b = io.BytesIO()
     im.save(b, "JPEG", quality=82, optimize=True)
     return b.getvalue()
@@ -160,8 +158,34 @@ def export_frame(df):
     return df[cols].rename(columns=LABELS)
 
 
-# ---------------------------------------------------------------- IA (Groq)
-PROMPT = """Tu examines les deux photos d'un même disque 78 tours. La PREMIÈRE photo montre la FACE A et la DEUXIÈME photo montre la FACE B. Lis séparément les deux étiquettes et retranscris fidèlement les titres et interprètes de chaque face. Ne devine jamais un texte illisible : indique-le dans notes. Renseigne aussi le label, la référence (numéro de catalogue), l'année si lisible, l'orchestre et les auteurs. Donne une estimation indicative de revente pour le disque complet en euros (nombres seuls dans estimation_basse_eur et estimation_haute_eur), sans la présenter comme une cote garantie. Dans identification_ia, résume en une phrase ton niveau de confiance. Sois très concis : chaque champ doit contenir une valeur courte, aucune explication hors JSON. Réponds uniquement en JSON valide avec les champs: titre_face_a, titre_face_b, interprete_face_a, interprete_face_b, orchestre, auteurs, label_marque, reference_disque, annee, estimation_basse_eur, estimation_haute_eur, notes, identification_ia. Les valeurs sont des chaînes de caractères."""
+# ---------------------------------------------------------------- IA (Gemini ou Groq)
+PROMPT = """Tu es un expert des disques 78 tours. Tu reçois deux photos d'un même disque : la PREMIÈRE est l'étiquette de la FACE A, la DEUXIÈME celle de la FACE B.
+Lis attentivement le texte imprimé sur chaque étiquette (y compris le texte courbe autour du bord, les petites mentions et les numéros) et retranscris-le fidèlement.
+- titre_face_a / titre_face_b : le titre de l'œuvre de chaque face.
+- interprete_face_a / interprete_face_b : le chanteur, l'artiste ou l'ensemble de chaque face.
+- orchestre : orchestre ou chef d'orchestre mentionné (souvent « avec orchestre sous la direction de… »).
+- auteurs : paroliers et compositeurs (souvent entre parenthèses sous le titre).
+- label_marque : la marque (Pathé, Columbia, Odéon, Gramophone / La Voix de son Maître, Polydor, Decca…).
+- reference_disque : le numéro de catalogue du disque (ex. « DF 1234 », « K 5678 »), pas le numéro de matrice.
+- annee : année si elle figure ou si tu peux la dater avec confiance d'après la référence, sinon vide.
+- estimation_basse_eur / estimation_haute_eur : estimation indicative de revente du disque en euros, nombre seul.
+- notes : ce qui est illisible ou incertain, numéros de matrice, mentions utiles.
+- identification_ia : une phrase sur ton niveau de confiance.
+N'invente rien : si un texte est illisible, laisse le champ vide et signale-le dans notes.
+Réponds UNIQUEMENT avec un objet JSON plat ayant exactement ces clés, valeurs en chaînes de caractères :
+{"titre_face_a": "", "interprete_face_a": "", "titre_face_b": "", "interprete_face_b": "", "orchestre": "", "auteurs": "", "label_marque": "", "reference_disque": "", "annee": "", "estimation_basse_eur": "", "estimation_haute_eur": "", "notes": "", "identification_ia": ""}"""
+
+PROVIDERS = {
+    "Gemini (Google)": {"section": "gemini", "model": "gemini-3.8-flash",
+                        "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                        "extra": {"max_tokens": 4000, "reasoning_effort": "low"}},
+    "Groq": {"section": "groq", "model": "qwen/qwen3.8-27b",
+             "url": "https://api.groq.com/openai/v1/chat/completions",
+             "extra": {"max_completion_tokens": 1500, "reasoning_effort": "none",
+                       "response_format": {"type": "json_object"}}},
+}
+AVAILABLE = {name: {**p, "key": secret(p["section"], "api_key"), "model": secret(p["section"], "model", p["model"])}
+             for name, p in PROVIDERS.items() if secret(p["section"], "api_key")}
 
 
 def parse_json(text):
@@ -175,19 +199,60 @@ def parse_json(text):
         raise
 
 
-def groq_error(response):
+def _norm(k):
+    k = unicodedata.normalize("NFKD", str(k)).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", "_", k).strip("_")
+
+
+SYNONYMS = {"titre": "titre", "title": "titre", "interprete": "interprete", "artiste": "interprete",
+            "artist": "interprete", "chanteur": "interprete", "performer": "interprete"}
+
+
+def normalize_result(data):
+    """Ramène une réponse IA aux champs de l'app, même si le modèle a imbriqué ou renommé les clés."""
+    if isinstance(data, list) and data:
+        data = data[0]
+    flat = {}
+
+    def walk(d, prefix=""):
+        for k, v in (d or {}).items():
+            key = _norm(f"{prefix}_{k}" if prefix else k)
+            if isinstance(v, dict):
+                walk(v, key)
+            elif v not in (None, "", []):
+                flat[key] = ", ".join(map(str, v)) if isinstance(v, list) else str(v).strip()
+    walk(data if isinstance(data, dict) else {})
+    out = {f: flat.get(f, "") for f in FIELDS}
+    aliases = {"label_marque": ["label", "marque", "maison_de_disques"],
+               "reference_disque": ["reference", "numero_catalogue", "catalogue", "ref"],
+               "annee": ["year", "date"], "orchestre": ["orchestra"], "auteurs": ["auteur", "compositeurs", "authors"]}
+    for f, alts in aliases.items():
+        out[f] = out[f] or next((flat[a] for a in alts if flat.get(a)), "")
+    for k, v in flat.items():  # face_a_titre, a_title, titre_a, side_a_title…
+        side = "a" if re.search(r"(^|_)(face_|side_)?a(_|$)", k) else "b" if re.search(r"(^|_)(face_|side_)?b(_|$)", k) else None
+        kind = next((SYNONYMS[w] for w in k.split("_") if w in SYNONYMS), None)
+        if side and kind and not out[f"{kind}_face_{side}"]:
+            out[f"{kind}_face_{side}"] = v
+    for f, pick in (("estimation_basse_eur", min), ("estimation_haute_eur", max)):
+        nums = [float(x.replace(",", ".")) for x in re.findall(r"\d+(?:[.,]\d+)?", out[f].replace(" ", ""))]
+        out[f] = f"{pick(nums):g}" if nums else ""
+    return out
+
+
+def api_error(response):
     try:
-        return response.json().get("error", {}).get("message", response.text)
+        j = response.json()
+        j = j[0] if isinstance(j, list) else j
+        return j.get("error", {}).get("message", response.text)
     except Exception:
         return response.text
 
 
-def identify(upload_a, upload_b):
-    if not GROQ_KEY:
-        raise ValueError("Clé Groq manquante dans les Secrets Streamlit. Ajoutez [groq] puis api_key.")
-    img = lambda u: "data:image/jpeg;base64," + base64.b64encode(jpg_bytes(u)).decode("ascii")
+def identify(provider, upload_a, upload_b):
+    p = AVAILABLE[provider]
+    img = lambda u: "data:image/jpeg;base64," + base64.b64encode(jpg_bytes(u, 2000)).decode("ascii")
     payload = {
-        "model": GROQ_MODEL,
+        "model": p["model"],
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": PROMPT},
             {"type": "text", "text": "PHOTO 1 — FACE A"},
@@ -195,24 +260,21 @@ def identify(upload_a, upload_b):
             {"type": "text", "text": "PHOTO 2 — FACE B"},
             {"type": "image_url", "image_url": {"url": img(upload_b)}},
         ]}],
-        "temperature": 0.2,
-        "max_completion_tokens": 900,
-        "reasoning_effort": "none",
-        "response_format": {"type": "json_object"},
+        "temperature": 0.1,
+        **p["extra"],
     }
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {p['key']}", "Content-Type": "application/json"}
     response = None
     for attempt in range(3):
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=(15, 180))
+            response = requests.post(p["url"], headers=headers, json=payload, timeout=(15, 180))
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             if attempt == 2:
-                raise RuntimeError("Groq ne répond pas après trois tentatives. Réessayez plus tard.") from e
+                raise RuntimeError(f"{provider} ne répond pas après trois tentatives. Réessayez plus tard.") from e
             time.sleep(3 * (attempt + 1))
             continue
         if response.status_code == 429 and attempt < 2:
-            m = re.search(r"try again in ([0-9.]+)s", groq_error(response), re.IGNORECASE)
+            m = re.search(r"try again in ([0-9.]+)s", api_error(response), re.IGNORECASE)
             time.sleep(min(60, max(2, int(float(m.group(1))) + 2)) if m else 20)
             continue
         if response.status_code >= 500 and attempt < 2:
@@ -221,13 +283,17 @@ def identify(upload_a, upload_b):
         break
     if response is None or response.status_code >= 400:
         code = response.status_code if response is not None else "réseau"
-        detail = groq_error(response) if response is not None else "Aucune réponse"
-        raise RuntimeError(f"Groq API ({code}) : {detail}")
+        detail = api_error(response) if response is not None else "Aucune réponse"
+        raise RuntimeError(f"{provider} ({code}) : {detail}")
     try:
-        data = parse_json(response.json()["choices"][0]["message"]["content"])
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
-        raise RuntimeError("Groq n'a pas renvoyé de JSON exploitable. Réessayez avec des photos plus nettes.") from e
-    return {f: ("" if data.get(f) is None else str(data.get(f)).strip()) for f in FIELDS}
+        raw = response.json()["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError, TypeError, ValueError):
+        raw = response.text
+    st.session_state.ai_raw = raw
+    try:
+        return normalize_result(parse_json(raw))
+    except (json.JSONDecodeError, TypeError, AttributeError) as e:
+        raise RuntimeError(f"{provider} n'a pas renvoyé de JSON exploitable (voir la réponse brute ci-dessous).") from e
 
 
 # ---------------------------------------------------------------- Formulaire commun
@@ -256,7 +322,8 @@ def duplicates(ref, exclude_id=None):
 head, logout = st.columns([6, 1])
 with head:
     st.title("💿 Ma collection de disques 78 tours")
-    st.caption(f"Photos et fiches conservées dans Supabase · identification par Groq ({GROQ_MODEL}).")
+    ia_txt = ", ".join(f"{k} ({v['model']})" for k, v in AVAILABLE.items()) or "aucune IA configurée"
+    st.caption(f"Photos et fiches conservées dans Supabase · identification : {ia_txt}.")
 with logout:
     st.write("")
     if st.button("🔄 Actualiser"):
@@ -293,21 +360,34 @@ with tabs[0]:
         st.session_state.pop("ai_result", None)
         st.session_state.pop("ai_sig", None)
 
-    if not GROQ_KEY:
-        st.info("Ajoutez [groq] api_key dans les Secrets pour activer l'identification automatique. "
-                "Vous pouvez quand même saisir la fiche à la main.")
+    if not AVAILABLE:
+        st.info("Ajoutez [gemini] api_key (ou [groq] api_key) dans les Secrets pour activer l'identification "
+                "automatique. Vous pouvez quand même saisir la fiche à la main.")
+        provider = None
+    elif len(AVAILABLE) > 1:
+        provider = st.radio("IA utilisée", list(AVAILABLE), horizontal=True, key="provider")
+    else:
+        provider = next(iter(AVAILABLE))
     if st.button("🔎 Analyser les deux faces", type="primary",
-                 disabled=not (GROQ_KEY and face_a_photo and face_b_photo)):
+                 disabled=not (provider and face_a_photo and face_b_photo)):
+        st.session_state.pop("ai_raw", None)
         try:
-            with st.spinner("Analyse des deux faces… cela peut prendre jusqu'à une minute."):
-                st.session_state.ai_result = identify(face_a_photo, face_b_photo)
+            with st.spinner(f"Analyse des deux faces avec {provider}… cela peut prendre jusqu'à une minute."):
+                st.session_state.ai_result = identify(provider, face_a_photo, face_b_photo)
                 st.session_state.ai_sig = photo_sig
                 st.session_state.ai_round = st.session_state.get("ai_round", 0) + 1
+            if not any(st.session_state.ai_result.values()):
+                st.warning("L'IA n'a rien pu lire sur ces photos. Essayez des photos plus nettes, bien de face, "
+                           "sans reflet, l'étiquette remplissant l'image" +
+                           (", ou l'autre IA." if len(AVAILABLE) > 1 else "."))
         except Exception as e:
             st.error(f"Erreur IA : {e}")
+    if st.session_state.get("ai_raw"):
+        with st.expander("Réponse brute de l'IA (pour diagnostic)"):
+            st.code(st.session_state.ai_raw)
 
     result = st.session_state.get("ai_result", {})
-    if result:
+    if any(result.values()):
         st.success("Analyse terminée : relisez et corrigez les champs ci-dessous avant d'enregistrer.")
         dups = duplicates(result.get("reference_disque"))
         if dups:
