@@ -76,6 +76,7 @@ with tabs[0]:
     c1,c2 = st.columns(2)
     with c1: label_photo = st.file_uploader("Photo nette de l'étiquette", type=["jpg","jpeg","png","webp"], key="label")
     with c2: cover_photo = st.file_uploader("Photo de la pochette (facultatif)", type=["jpg","jpeg","png","webp"], key="cover")
+    face_selection = st.radio("Face photographiée / renseignée", ["Face A", "Face B"], horizontal=True, key="new_face")
     state = st.selectbox("État", ["Très bon état","Bon état","État moyen","Abîmé"])
     cover = st.radio("Pochette présente ?", ["Oui","Non","À confirmer"], horizontal=True)
     if label_photo:
@@ -102,7 +103,7 @@ with tabs[0]:
                     p2 = None
                     if cover_photo:
                         p2 = f"{did}/pochette.jpg"; sb.storage.from_("disques-photos").upload(p2, jpg_bytes(cover_photo), {"content-type":"image/jpeg","upsert":"true"})
-                    payload = {"id":did, "created_at":datetime.now().astimezone().isoformat(), **vals, "etat":state, "pochette":cover, "photo_etiquette":p1, "photo_pochette":p2}
+                    payload = {"id":did, "created_at":datetime.now().astimezone().isoformat(), **vals, "etat":state, "face_selection":face_selection, "pochette":cover, "photo_etiquette":p1, "photo_pochette":p2}
                     sb.table("disques").insert(payload).execute()
                     st.session_state.pop("ai_result",None); st.success("Disque enregistré."); st.rerun()
                 except Exception as e: st.error(f"Enregistrement impossible : {e}")
@@ -111,8 +112,10 @@ with tabs[1]:
         df = pd.DataFrame(records).fillna("")
         q = st.text_input("Rechercher un titre, interprète, orchestre, auteur ou référence")
         if q: df = df[df.astype(str).apply(lambda c:c.str.contains(q,case=False,na=False)).any(axis=1)]
-        cols = ["titre_face_a","titre_face_b","interprete_face_a","interprete_face_b","orchestre","auteurs","label_marque","reference_disque","annee","etat","pochette","estimation_basse_eur","estimation_haute_eur"]
-        st.dataframe(df[[c for c in cols if c in df.columns]], use_container_width=True, hide_index=True)
+        df["Face A"] = df.apply(lambda r: " — ".join(str(x) for x in [r.get("titre_face_a", ""), r.get("interprete_face_a", "")] if str(x or "").strip()), axis=1)
+        df["Face B"] = df.apply(lambda r: " — ".join(str(x) for x in [r.get("titre_face_b", ""), r.get("interprete_face_b", "")] if str(x or "").strip()), axis=1)
+        cols = ["Face A", "Face B", "orchestre", "auteurs", "label_marque", "reference_disque", "annee", "etat", "pochette", "estimation_basse_eur", "estimation_haute_eur"]
+        st.dataframe(df[[col for col in cols if col in df.columns]], use_container_width=True, hide_index=True)
         options = df.to_dict("records")
         if options:
             chosen = st.selectbox("Détail du disque", options, format_func=lambda r:f"{r.get('titre_face_a') or 'Titre inconnu'} — {r.get('interprete_face_a') or 'Interprète inconnu'}", key="chosen")
@@ -134,6 +137,9 @@ with tabs[1]:
                                 edit_vals[field_name] = st.text_area(field_name.replace("_", " ").capitalize(), value=current, height=80, key="edit_" + field_name)
                             else:
                                 edit_vals[field_name] = st.text_input(field_name.replace("_", " ").capitalize(), value=current, key="edit_" + field_name)
+                    faces_edit = ["Face A", "Face B"]
+                    face_actuelle = chosen.get("face_selection") or "Face A"
+                    edit_face = st.radio("Face photographiée / renseignée", faces_edit, index=faces_edit.index(face_actuelle) if face_actuelle in faces_edit else 0, horizontal=True)
                     etats_edit = ["Très bon état", "Bon état", "État moyen", "Abîmé"]
                     etat_actuel = chosen.get("etat") or "Très bon état"
                     edit_etat = st.selectbox("État du disque", etats_edit, index=etats_edit.index(etat_actuel) if etat_actuel in etats_edit else 0)
@@ -143,6 +149,7 @@ with tabs[1]:
                     save_edit = st.form_submit_button("Enregistrer les modifications", type="primary")
                 if save_edit:
                     try:
+                        edit_vals["face_selection"] = edit_face
                         edit_vals["etat"] = edit_etat
                         edit_vals["pochette"] = edit_pochette
                         sb.table("disques").update(edit_vals).eq("id", chosen["id"]).execute()
@@ -212,7 +219,9 @@ with tabs[3]:
             st.info("Les années ne sont pas encore renseignées pour les disques.")
 
         st.markdown("#### Liste récapitulative")
-        display_cols = ["titre_face_a", "interprete_face_a", "titre_face_b", "interprete_face_b", "label_marque", "reference_disque", "annee", "etat", "pochette", "estimation_basse_eur", "estimation_haute_eur"]
+        recap["Face A"] = recap.apply(lambda r: " — ".join(str(x) for x in [r.get("titre_face_a", ""), r.get("interprete_face_a", "")] if str(x or "").strip()), axis=1)
+        recap["Face B"] = recap.apply(lambda r: " — ".join(str(x) for x in [r.get("titre_face_b", ""), r.get("interprete_face_b", "")] if str(x or "").strip()), axis=1)
+        display_cols = ["Face A", "Face B", "label_marque", "reference_disque", "annee", "etat", "pochette", "estimation_basse_eur", "estimation_haute_eur"]
         summary = recap[[col for col in display_cols if col in recap.columns]].copy()
         st.dataframe(summary, use_container_width=True, hide_index=True)
         st.download_button("Télécharger l’état récapitulatif (CSV pour Excel)", summary.to_csv(index=False).encode("utf-8-sig"), "etat_recapitulatif_78_tours.csv", "text/csv")
