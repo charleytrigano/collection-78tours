@@ -1,296 +1,620 @@
-import base64, io, json, uuid, time, re
+import base64, hmac, io, json, re, time, unicodedata, uuid
 from datetime import datetime
+
 import pandas as pd
-import streamlit as st
 import requests
-from PIL import Image
+import streamlit as st
+from PIL import Image, ImageOps
 from supabase import create_client
 
 st.set_page_config(page_title="Ma collection de 78 tours", page_icon="💿", layout="wide")
 
-def secret(section, key):
-    try: return st.secrets[section][key]
-    except Exception: return ""
+BUCKET = "disques-photos"
+ETATS = ["Très bon état", "Bon état", "État moyen", "Abîmé"]
+POCHETTES = ["Oui", "Non", "À confirmer"]
+FIELDS = ["titre_face_a", "interprete_face_a", "titre_face_b", "interprete_face_b", "orchestre", "auteurs",
+          "label_marque", "reference_disque", "annee", "estimation_basse_eur", "estimation_haute_eur",
+          "notes", "identification_ia"]
+LONG_FIELDS = ("notes", "identification_ia")
+LABELS = {
+    "titre_face_a": "Titre face A", "interprete_face_a": "Interprète face A",
+    "titre_face_b": "Titre face B", "interprete_face_b": "Interprète face B",
+    "orchestre": "Orchestre", "auteurs": "Auteurs", "label_marque": "Marque / label",
+    "reference_disque": "Référence", "annee": "Année",
+    "estimation_basse_eur": "Estimation basse (€)", "estimation_haute_eur": "Estimation haute (€)",
+    "notes": "Notes", "identification_ia": "Identification IA",
+    "etat": "État", "pochette": "Pochette", "created_at": "Date d'ajout", "id": "Identifiant",
+    "Face A": "Face A", "Face B": "Face B",
+}
+PHOTOS = [("photo_etiquette", "etiquette", "Face A"), ("photo_face_b", "face_b", "Face B"),
+          ("photo_pochette", "pochette", "Pochette")]
+IMG_TYPES = ["jpg", "jpeg", "png", "webp"]
 
+
+def secret(section, key, default=""):
+    try:
+        return st.secrets[section][key]
+    except Exception:
+        return default
+
+
+# ---------------------------------------------------------------- Connexion
 password = secret("app", "password")
 if not password:
     st.error("Configuration manquante : ajoutez [app] password dans les Secrets Streamlit.")
     st.stop()
 if not st.session_state.get("auth_ok"):
     st.title("💿 Ma collection de disques 78 tours")
-    entered = st.text_input("Mot de passe", type="password")
-    if st.button("Se connecter", type="primary"):
-        if entered == password:
+    with st.form("login"):
+        entered = st.text_input("Mot de passe", type="password")
+        ok = st.form_submit_button("Se connecter", type="primary")
+    if ok:
+        if hmac.compare_digest(entered.encode(), str(password).encode()):
             st.session_state.auth_ok = True
             st.rerun()
+        time.sleep(1)  # freine les essais en rafale
         st.error("Mot de passe incorrect.")
     st.stop()
 
+
+
 @st.cache_resource
 def db():
-    return create_client(secret("supabase","url"), secret("supabase","service_role_key"))
+    return create_client(secret("supabase", "url"), secret("supabase", "service_role_key"))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_records():
+    return db().table("disques").select("*").order("created_at", desc=True).execute().data or []
+
+
+def refresh():
+    load_records.clear()
+    st.rerun()
+
+
 try:
     sb = db()
-    records = sb.table("disques").select("*").order("created_at", desc=True).execute().data or []
+    records = load_records()
 except Exception as e:
     st.error("Connexion Supabase impossible. Vérifiez les Secrets et exécutez supabase_schema.sql.")
-    st.code(str(e)); st.stop()
+    st.code(str(e))
+    st.stop()
 
-st.title("💿 Ma collection de disques 78 tours")
-st.caption("Les photos et les fiches sont conservées dans Supabase. L’identification des deux faces utilise Groq (modèle Qwen vision).")
-api_key = secret("groq","api_key")
 
-def jpg_bytes(upload):
-    im = Image.open(upload).convert("RGB"); im.thumbnail((1200,1200))
-    b = io.BytesIO(); im.save(b, "JPEG", quality=78, optimize=True); return b.getvalue()
+# ---------------------------------------------------------------- Utilitaires
+def jpg_bytes(upload, size=1600):
+    """Convertit une photo en JPEG redressé (orientation EXIF des téléphones) et réduit."""
+    im = Image.open(io.BytesIO(upload.getvalue()))
+    im = ImageOps.exif_transpose(im).convert("RGB")
+    im.thumbnail((size, size))
+    b = io.BytesIO()
+    im.save(b, "JPEG", quality=82, optimize=True)
+    return b.getvalue()
 
-def identify(upload_a, upload_b):
-    if not api_key:
-        raise ValueError("Clé Groq manquante dans les Secrets Streamlit. Ajoutez [groq] puis api_key.")
-    raw_a = jpg_bytes(upload_a)
-    raw_b = jpg_bytes(upload_b)
-    prompt = """Tu examines les deux photos d'un même disque 78 tours. La PREMIÈRE photo montre la FACE A et la DEUXIÈME photo montre la FACE B. Lis séparément les deux étiquettes et retranscris fidèlement les titres et interprètes de chaque face. Ne devine jamais un texte illisible : indique-le dans notes. Renseigne aussi le label, la référence, l'année si lisible, l'orchestre et les auteurs. Donne une estimation indicative de revente pour le disque complet en euros, sans la présenter comme une cote garantie. Sois très concis : chaque champ doit contenir une valeur courte, aucune explication hors JSON. Réponds uniquement en JSON valide avec les champs: titre_face_a, titre_face_b, interprete_face_a, interprete_face_b, orchestre, auteurs, label_marque, reference_disque, annee, estimation_basse_eur, estimation_haute_eur, notes, identification_ia. Les valeurs peuvent être des chaînes de caractères."""
-    image_a = "data:image/jpeg;base64," + base64.b64encode(raw_a).decode("ascii")
-    image_b = "data:image/jpeg;base64," + base64.b64encode(raw_b).decode("ascii")
+
+def upload_photo(path, upload):
+    sb.storage.from_(BUCKET).upload(path, jpg_bytes(upload), {"content-type": "image/jpeg", "upsert": "true"})
+
+
+@st.cache_data(ttl=3000, show_spinner=False)
+def signed_url(path):
+    res = sb.storage.from_(BUCKET).create_signed_url(path, 3600)
+    return res.get("signedURL") or res.get("signedUrl") if isinstance(res, dict) else getattr(res, "signed_url", None)
+
+
+def euro_number(value):
+    """'12', '12,50 €', 'env. 15', '10-15' → premier nombre trouvé."""
+    m = re.search(r"\d+(?:[.,]\d+)?", str(value or "").replace(" ", "").replace(" ", ""))
+    return float(m.group().replace(",", ".")) if m else None
+
+
+def year_number(value):
+    m = re.search(r"(18|19|20)\d{2}", str(value or ""))
+    return int(m.group()) if m else None
+
+
+def fmt_eur(x):
+    return "—" if x is None or pd.isna(x) else f"{x:,.0f} €".replace(",", " ")
+
+
+def face(r, side):
+    return " — ".join(str(r.get(k) or "").strip() for k in (f"titre_face_{side}", f"interprete_face_{side}")
+                      if str(r.get(k) or "").strip())
+
+
+def prepare(recs):
+    df = pd.DataFrame(recs)
+    for c in FIELDS + ["etat", "pochette", "created_at", "id"] + [p[0] for p in PHOTOS]:
+        if c not in df.columns:
+            df[c] = ""
+    df = df.fillna("")
+    df["Face A"] = df.apply(lambda r: face(r, "a"), axis=1)
+    df["Face B"] = df.apply(lambda r: face(r, "b"), axis=1)
+    df["_basse"] = df["estimation_basse_eur"].apply(euro_number)
+    df["_haute"] = df["estimation_haute_eur"].apply(euro_number)
+    # Une seule estimation saisie → elle sert de borne basse ET haute (évite un total bas > total haut).
+    df["_basse"], df["_haute"] = df["_basse"].fillna(df["_haute"]), df["_haute"].fillna(df["_basse"])
+    df["_annee"] = df["annee"].apply(year_number)
+    return df
+
+
+def to_excel(df):
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as xw:
+        df.to_excel(xw, index=False, sheet_name="Collection")
+        ws = xw.sheets["Collection"]
+        for col in ws.columns:
+            width = max(len(str(c.value or "")) for c in col[:200])
+            ws.column_dimensions[col[0].column_letter].width = min(50, max(10, width + 2))
+        ws.freeze_panes = "A2"
+    return out.getvalue()
+
+
+def export_frame(df):
+    cols = ["titre_face_a", "interprete_face_a", "titre_face_b", "interprete_face_b", "orchestre", "auteurs",
+            "label_marque", "reference_disque", "annee", "etat", "pochette", "estimation_basse_eur",
+            "estimation_haute_eur", "notes", "created_at"]
+    return df[cols].rename(columns=LABELS)
+
+
+# ---------------------------------------------------------------- IA (Gemini ou Groq)
+PROMPT = """Tu es un expert des disques 78 tours. Tu reçois deux photos d'un même disque : la PREMIÈRE est l'étiquette de la FACE A, la DEUXIÈME celle de la FACE B.
+Lis attentivement le texte imprimé sur chaque étiquette (y compris le texte courbe autour du bord, les petites mentions et les numéros) et retranscris-le fidèlement.
+- titre_face_a / titre_face_b : le titre de l'œuvre de chaque face.
+- interprete_face_a / interprete_face_b : le chanteur, l'artiste ou l'ensemble de chaque face.
+- orchestre : orchestre ou chef d'orchestre mentionné (souvent « avec orchestre sous la direction de… »).
+- auteurs : paroliers et compositeurs (souvent entre parenthèses sous le titre).
+- label_marque : la marque (Pathé, Columbia, Odéon, Gramophone / La Voix de son Maître, Polydor, Decca…).
+- reference_disque : le numéro de catalogue du disque (ex. « DF 1234 », « K 5678 »), pas le numéro de matrice.
+- annee : année si elle figure ou si tu peux la dater avec confiance d'après la référence, sinon vide.
+- estimation_basse_eur / estimation_haute_eur : estimation indicative de revente du disque en euros, nombre seul.
+- notes : ce qui est illisible ou incertain, numéros de matrice, mentions utiles.
+- identification_ia : une phrase sur ton niveau de confiance.
+N'invente rien : si un texte est illisible, laisse le champ vide et signale-le dans notes.
+Réponds UNIQUEMENT avec un objet JSON plat ayant exactement ces clés, valeurs en chaînes de caractères :
+{"titre_face_a": "", "interprete_face_a": "", "titre_face_b": "", "interprete_face_b": "", "orchestre": "", "auteurs": "", "label_marque": "", "reference_disque": "", "annee": "", "estimation_basse_eur": "", "estimation_haute_eur": "", "notes": "", "identification_ia": ""}"""
+
+PROVIDERS = {
+    "Gemini (Google)": {"section": "gemini", "model": "gemini-3.8-flash",
+                        "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                        "extra": {"max_tokens": 4000, "reasoning_effort": "low"}},
+    "Groq": {"section": "groq", "model": "qwen/qwen3.8-27b",
+             "url": "https://api.groq.com/openai/v1/chat/completions",
+             "extra": {"max_completion_tokens": 1500, "reasoning_effort": "none",
+                       "response_format": {"type": "json_object"}}},
+}
+AVAILABLE = {name: {**p, "key": secret(p["section"], "api_key"), "model": secret(p["section"], "model", p["model"])}
+             for name, p in PROVIDERS.items() if secret(p["section"], "api_key")}
+
+
+def parse_json(text):
+    text = re.sub(r"^```(?:json)?|```$", "", (text or "").strip(), flags=re.MULTILINE).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m:
+            return json.loads(m.group())
+        raise
+
+
+def _norm(k):
+    k = unicodedata.normalize("NFKD", str(k)).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", "_", k).strip("_")
+
+
+SYNONYMS = {"titre": "titre", "title": "titre", "interprete": "interprete", "artiste": "interprete",
+            "artist": "interprete", "chanteur": "interprete", "performer": "interprete"}
+
+
+def normalize_result(data):
+    """Ramène une réponse IA aux champs de l'app, même si le modèle a imbriqué ou renommé les clés."""
+    if isinstance(data, list) and data:
+        data = data[0]
+    flat = {}
+
+    def walk(d, prefix=""):
+        for k, v in (d or {}).items():
+            key = _norm(f"{prefix}_{k}" if prefix else k)
+            if isinstance(v, dict):
+                walk(v, key)
+            elif v not in (None, "", []):
+                flat[key] = ", ".join(map(str, v)) if isinstance(v, list) else str(v).strip()
+    walk(data if isinstance(data, dict) else {})
+    out = {f: flat.get(f, "") for f in FIELDS}
+    aliases = {"label_marque": ["label", "marque", "maison_de_disques"],
+               "reference_disque": ["reference", "numero_catalogue", "catalogue", "ref"],
+               "annee": ["year", "date"], "orchestre": ["orchestra"], "auteurs": ["auteur", "compositeurs", "authors"]}
+    for f, alts in aliases.items():
+        out[f] = out[f] or next((flat[a] for a in alts if flat.get(a)), "")
+    for k, v in flat.items():  # face_a_titre, a_title, titre_a, side_a_title…
+        side = "a" if re.search(r"(^|_)(face_|side_)?a(_|$)", k) else "b" if re.search(r"(^|_)(face_|side_)?b(_|$)", k) else None
+        kind = next((SYNONYMS[w] for w in k.split("_") if w in SYNONYMS), None)
+        if side and kind and not out[f"{kind}_face_{side}"]:
+            out[f"{kind}_face_{side}"] = v
+    for f, pick in (("estimation_basse_eur", min), ("estimation_haute_eur", max)):
+        nums = [float(x.replace(",", ".")) for x in re.findall(r"\d+(?:[.,]\d+)?", out[f].replace(" ", ""))]
+        out[f] = f"{pick(nums):g}" if nums else ""
+    return out
+
+
+def api_error(response):
+    try:
+        j = response.json()
+        j = j[0] if isinstance(j, list) else j
+        return j.get("error", {}).get("message", response.text)
+    except Exception:
+        return response.text
+
+
+def identify(provider, upload_a, upload_b):
+    p = AVAILABLE[provider]
+    img = lambda u: "data:image/jpeg;base64," + base64.b64encode(jpg_bytes(u, 2000)).decode("ascii")
     payload = {
-        "model": "qwen/qwen3.8-27b",
+        "model": p["model"],
         "messages": [{"role": "user", "content": [
-            {"type": "text", "text": prompt},
+            {"type": "text", "text": PROMPT},
             {"type": "text", "text": "PHOTO 1 — FACE A"},
-            {"type": "image_url", "image_url": {"url": image_a}},
+            {"type": "image_url", "image_url": {"url": img(upload_a)}},
             {"type": "text", "text": "PHOTO 2 — FACE B"},
-            {"type": "image_url", "image_url": {"url": image_b}}
+            {"type": "image_url", "image_url": {"url": img(upload_b)}},
         ]}],
-        "temperature": 0.2,
-        "max_completion_tokens": 900,
-        "reasoning_effort": "none",
-        "response_format": {"type": "json_object"}
+        "temperature": 0.1,
+        **p["extra"],
     }
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {p['key']}", "Content-Type": "application/json"}
     response = None
-    for attempt in range(2):
+    for attempt in range(3):
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=(15, 180))
+            response = requests.post(p["url"], headers=headers, json=payload, timeout=(15, 180))
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            if attempt == 1:
-                raise RuntimeError("Groq ne répond toujours pas après deux tentatives. Réessayez.") from e
-            time.sleep(3)
+            if attempt == 2:
+                raise RuntimeError(f"{provider} ne répond pas après trois tentatives. Réessayez plus tard.") from e
+            time.sleep(3 * (attempt + 1))
             continue
-        if response.status_code == 429 and attempt == 0:
-            try:
-                detail = response.json().get("error", {}).get("message", response.text)
-            except Exception:
-                detail = response.text
-            match = re.search(r"try again in ([0-9.]+)s", detail, re.IGNORECASE)
-            wait_seconds = min(60, max(2, int(float(match.group(1))) + 2)) if match else 30
-            time.sleep(wait_seconds)
+        if response.status_code == 429 and attempt < 2:
+            m = re.search(r"try again in ([0-9.]+)s", api_error(response), re.IGNORECASE)
+            time.sleep(min(60, max(2, int(float(m.group(1))) + 2)) if m else 20)
+            continue
+        if response.status_code >= 500 and attempt < 2:
+            time.sleep(3)
             continue
         break
     if response is None or response.status_code >= 400:
-        try: detail = response.json().get("error", {}).get("message", response.text) if response is not None else "Aucune réponse de Groq"
-        except Exception: detail = response.text if response is not None else "Aucune réponse de Groq"
-        if response is not None and response.status_code == 429:
-            raise RuntimeError(f"Limite Groq toujours atteinte après une attente automatique : {detail}")
-        raise RuntimeError(f"Groq API ({response.status_code if response is not None else 'erreur réseau'}) : {detail}")
+        code = response.status_code if response is not None else "réseau"
+        detail = api_error(response) if response is not None else "Aucune réponse"
+        raise RuntimeError(f"{provider} ({code}) : {detail}")
     try:
-        return json.loads(response.json()["choices"][0]["message"]["content"])
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
-        raise RuntimeError("Groq n'a pas renvoyé de réponse JSON exploitable. Réessayez avec des photos plus nettes.") from e
+        raw = response.json()["choices"][0]["message"]["content"] or ""
+    except (KeyError, IndexError, TypeError, ValueError):
+        raw = response.text
+    st.session_state.ai_raw = raw
+    try:
+        return normalize_result(parse_json(raw))
+    except (json.JSONDecodeError, TypeError, AttributeError) as e:
+        raise RuntimeError(f"{provider} n'a pas renvoyé de JSON exploitable (voir la réponse brute ci-dessous).") from e
 
-tabs = st.tabs(["➕ Ajouter un disque", "📚 Catalogue", "⬇️ Exporter", "📊 État récapitulatif"])
-fields = ["titre_face_a","interprete_face_a","titre_face_b","interprete_face_b","orchestre","auteurs","label_marque","reference_disque","annee","estimation_basse_eur","estimation_haute_eur","notes","identification_ia"]
-with tabs[0]:
-    st.write("Photographiez les deux étiquettes du même disque. L’IA les analysera ensemble pour créer une seule fiche.")
-    c1,c2 = st.columns(2)
-    with c1: face_a_photo = st.file_uploader("📷 Photo de la face A (obligatoire)", type=["jpg","jpeg","png","webp"], key="face_a_photo")
-    with c2: face_b_photo = st.file_uploader("📷 Photo de la face B (obligatoire)", type=["jpg","jpeg","png","webp"], key="face_b_photo")
-    cover_photo = st.file_uploader("Photo de la pochette (facultatif)", type=["jpg","jpeg","png","webp"], key="cover")
-    if face_a_photo:
-        with c1: st.image(face_a_photo, caption="Face A", width=280)
-    if face_b_photo:
-        with c2: st.image(face_b_photo, caption="Face B", width=280)
-    state = st.selectbox("État", ["Très bon état","Bon état","État moyen","Abîmé"])
-    cover = st.radio("Pochette présente ?", ["Oui","Non","À confirmer"], horizontal=True)
-    if st.button("🔎 Analyser les deux faces avec Groq", type="primary", disabled=(not api_key or not face_a_photo or not face_b_photo)):
-        try:
-            with st.spinner("Analyse des deux faces… cela peut prendre un peu de temps."):
-                st.session_state.ai_result = identify(face_a_photo, face_b_photo)
-        except Exception as e: st.error(f"Erreur IA : {e}")
-    result = st.session_state.get("ai_result", {})
-    with st.form("new_record"):
-        st.subheader("Vérifiez les informations avant l'enregistrement")
-        vals = {}
-        a,b = st.columns(2)
-        for i,f in enumerate(fields):
-            with (a if i < 7 else b):
-                default = str(result.get(f,"") or "")
-                vals[f] = st.text_area(f.replace("_"," ").capitalize(), value=default, height=70 if f in ("notes","identification_ia") else 40) if f in ("notes","identification_ia") else st.text_input(f.replace("_"," ").capitalize(), value=default)
-        if st.form_submit_button("Enregistrer le disque", type="primary"):
-            if not face_a_photo or not face_b_photo:
-                st.error("Ajoutez les photos des faces A et B.")
+
+# ---------------------------------------------------------------- Formulaire commun
+def field_inputs(source, prefix):
+    vals = {}
+    left, right = st.columns(2)
+    for i, f in enumerate(FIELDS):
+        with (left if i < 7 else right):
+            current = str(source.get(f) or "")
+            if f in LONG_FIELDS:
+                vals[f] = st.text_area(LABELS[f], value=current, height=90, key=f"{prefix}_{f}")
             else:
-                try:
-                    did = str(uuid.uuid4())
-                    p1 = f"{did}/etiquette.jpg"
-                    sb.storage.from_("disques-photos").upload(p1, jpg_bytes(face_a_photo), {"content-type":"image/jpeg","upsert":"true"})
-                    p_face_b = f"{did}/face_b.jpg"
-                    sb.storage.from_("disques-photos").upload(p_face_b, jpg_bytes(face_b_photo), {"content-type":"image/jpeg","upsert":"true"})
-                    p2 = None
-                    if cover_photo:
-                        p2 = f"{did}/pochette.jpg"
-                        sb.storage.from_("disques-photos").upload(p2, jpg_bytes(cover_photo), {"content-type":"image/jpeg","upsert":"true"})
-                    payload = {"id":did, "created_at":datetime.now().astimezone().isoformat(), **vals, "etat":state, "pochette":cover, "photo_etiquette":p1, "photo_face_b":p_face_b, "photo_pochette":p2}
-                    sb.table("disques").insert(payload).execute()
-                    st.session_state.pop("ai_result",None); st.success("Disque enregistré avec les deux faces."); st.rerun()
-                except Exception as e: st.error(f"Enregistrement impossible : {e}")
-with tabs[1]:
-    if records:
-        df = pd.DataFrame(records).fillna("")
-        q = st.text_input("Rechercher un titre, interprète, orchestre, auteur ou référence")
-        if q: df = df[df.astype(str).apply(lambda c:c.str.contains(q,case=False,na=False)).any(axis=1)]
-        df["Face A"] = df.apply(lambda r: " — ".join(str(x) for x in [r.get("titre_face_a", ""), r.get("interprete_face_a", "")] if str(x or "").strip()), axis=1)
-        df["Face B"] = df.apply(lambda r: " — ".join(str(x) for x in [r.get("titre_face_b", ""), r.get("interprete_face_b", "")] if str(x or "").strip()), axis=1)
-        cols = ["Face A", "Face B", "orchestre", "auteurs", "label_marque", "reference_disque", "annee", "etat", "pochette", "estimation_basse_eur", "estimation_haute_eur"]
-        visible_cols = [col for col in cols if col in df.columns]
-        st.markdown("#### Trier le catalogue")
-        sort_labels = {
-            "Face A": "Face A — titre / interprète",
-            "Face B": "Face B — titre / interprète",
-            "titre_face_a": "Titre face A",
-            "interprete_face_a": "Interprète face A",
-            "titre_face_b": "Titre face B",
-            "interprete_face_b": "Interprète face B",
-            "orchestre": "Orchestre",
-            "auteurs": "Auteurs",
-            "label_marque": "Marque / label",
-            "reference_disque": "Référence",
-            "annee": "Année",
-            "etat": "État",
-            "pochette": "Pochette",
-            "estimation_basse_eur": "Estimation basse (€)",
-            "estimation_haute_eur": "Estimation haute (€)",
-            "notes": "Notes",
-            "identification_ia": "Identification IA",
-            "created_at": "Date d'ajout",
-            "id": "Identifiant"
-        }
-        sort_keys = [key for key in sort_labels if key in df.columns]
-        sort_c1, sort_c2 = st.columns([3, 2])
-        with sort_c1:
-            sort_by = st.selectbox("Trier par", sort_keys, format_func=lambda key: sort_labels[key], key="catalog_sort_by")
-        with sort_c2:
-            sort_order = st.radio("Ordre", ["Croissant (A → Z / plus petit au plus grand)", "Décroissant (Z → A / plus grand au plus petit)"], horizontal=False, key="catalog_sort_order")
-        if sort_by in ("annee", "estimation_basse_eur", "estimation_haute_eur"):
-            df["_sort_value"] = pd.to_numeric(df[sort_by].astype(str).str.replace("€", "", regex=False).str.replace(",", ".", regex=False), errors="coerce")
-        elif sort_by == "created_at":
-            df["_sort_value"] = pd.to_datetime(df[sort_by], errors="coerce", utc=True)
+                vals[f] = st.text_input(LABELS[f], value=current, key=f"{prefix}_{f}")
+    return vals
+
+
+def duplicates(ref, exclude_id=None):
+    ref = (ref or "").strip().casefold()
+    if not ref:
+        return []
+    return [r for r in records if str(r.get("reference_disque") or "").strip().casefold() == ref
+            and r.get("id") != exclude_id]
+
+
+# ---------------------------------------------------------------- En-tête
+head, logout = st.columns([6, 1])
+with head:
+    st.title("💿 Ma collection de disques 78 tours")
+    ia_txt = ", ".join(f"{k} ({v['model']})" for k, v in AVAILABLE.items()) or "aucune IA configurée"
+    st.caption(f"Photos et fiches conservées dans Supabase · identification : {ia_txt}.")
+with logout:
+    st.write("")
+    if st.button("🔄 Actualiser"):
+        refresh()
+    if st.button("Se déconnecter"):
+        st.session_state.clear()
+        st.rerun()
+
+tabs = st.tabs(["➕ Ajouter un disque", "📚 Catalogue", "📊 Récapitulatif", "⬇️ Exporter"])
+
+# ---------------------------------------------------------------- Ajout
+with tabs[0]:
+    n = st.session_state.setdefault("form_nonce", 0)  # change après chaque enregistrement → formulaire vidé
+    if st.session_state.pop("just_saved", False):
+        st.success("Disque enregistré avec les deux faces. Vous pouvez photographier le suivant.")
+    st.write("Photographiez les deux étiquettes du même disque. L'IA les analyse ensemble pour créer une seule fiche.")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        face_a_photo = st.file_uploader("📷 Face A (obligatoire)", type=IMG_TYPES, key=f"fa_{n}")
+        if face_a_photo:
+            st.image(face_a_photo, width=260)
+    with c2:
+        face_b_photo = st.file_uploader("📷 Face B (obligatoire)", type=IMG_TYPES, key=f"fb_{n}")
+        if face_b_photo:
+            st.image(face_b_photo, width=260)
+    with c3:
+        cover_photo = st.file_uploader("Pochette (facultatif)", type=IMG_TYPES, key=f"cv_{n}")
+        if cover_photo:
+            st.image(cover_photo, width=260)
+
+    # Si les photos changent, l'ancienne analyse IA n'est plus valable.
+    photo_sig = (face_a_photo.file_id if face_a_photo else None, face_b_photo.file_id if face_b_photo else None)
+    if st.session_state.get("ai_sig") not in (None, photo_sig):
+        st.session_state.pop("ai_result", None)
+        st.session_state.pop("ai_sig", None)
+
+    if not AVAILABLE:
+        st.info("Ajoutez [gemini] api_key (ou [groq] api_key) dans les Secrets pour activer l'identification "
+                "automatique. Vous pouvez quand même saisir la fiche à la main.")
+        provider = None
+    elif len(AVAILABLE) > 1:
+        provider = st.radio("IA utilisée", list(AVAILABLE), horizontal=True, key="provider")
+    else:
+        provider = next(iter(AVAILABLE))
+    if st.button("🔎 Analyser les deux faces", type="primary",
+                 disabled=not (provider and face_a_photo and face_b_photo)):
+        st.session_state.pop("ai_raw", None)
+        try:
+            with st.spinner(f"Analyse des deux faces avec {provider}… cela peut prendre jusqu'à une minute."):
+                st.session_state.ai_result = identify(provider, face_a_photo, face_b_photo)
+                st.session_state.ai_sig = photo_sig
+                st.session_state.ai_round = st.session_state.get("ai_round", 0) + 1
+            if not any(st.session_state.ai_result.values()):
+                st.warning("L'IA n'a rien pu lire sur ces photos. Essayez des photos plus nettes, bien de face, "
+                           "sans reflet, l'étiquette remplissant l'image" +
+                           (", ou l'autre IA." if len(AVAILABLE) > 1 else "."))
+        except Exception as e:
+            st.error(f"Erreur IA : {e}")
+    if st.session_state.get("ai_raw"):
+        with st.expander("Réponse brute de l'IA (pour diagnostic)"):
+            st.code(st.session_state.ai_raw)
+
+    result = st.session_state.get("ai_result", {})
+    if any(result.values()):
+        st.success("Analyse terminée : relisez et corrigez les champs ci-dessous avant d'enregistrer.")
+        dups = duplicates(result.get("reference_disque"))
+        if dups:
+            st.warning(f"⚠️ La référence « {result.get('reference_disque')} » existe déjà dans la collection "
+                       f"({face(dups[0], 'a') or 'sans titre'}). Doublon possible.")
+
+    with st.form(f"new_record_{n}"):
+        st.subheader("Fiche du disque")
+        vals = field_inputs(result, f"new{n}_{st.session_state.get('ai_round', 0)}")
+        s1, s2 = st.columns(2)
+        with s1:
+            state = st.selectbox("État", ETATS)
+        with s2:
+            cover = st.radio("Pochette présente ?", POCHETTES, index=0 if cover_photo else 2, horizontal=True)
+        submitted = st.form_submit_button("💾 Enregistrer le disque", type="primary")
+    if submitted:
+        if not face_a_photo or not face_b_photo:
+            st.error("Ajoutez les photos des faces A et B.")
+        elif not any(vals[f].strip() for f in ("titre_face_a", "titre_face_b", "reference_disque")):
+            st.error("Renseignez au moins un titre ou la référence du disque.")
         else:
-            df["_sort_value"] = df[sort_by].astype(str).str.casefold()
-        df = df.sort_values("_sort_value", ascending=sort_order.startswith("Croissant"), na_position="last", kind="stable").drop(columns=["_sort_value"])
-        st.dataframe(df[visible_cols], use_container_width=True, hide_index=True)
-        options = df.to_dict("records")
-        if options:
-            chosen = st.selectbox("Détail du disque", options, format_func=lambda r:f"{r.get('titre_face_a') or 'Titre inconnu'} — {r.get('interprete_face_a') or 'Interprète inconnu'}", key="chosen")
-            for f in fields + ["etat","pochette"]:
-                st.write(f"**{f.replace('_',' ').capitalize()} :** {chosen.get(f) or '—'}")
-            for key,caption in [("photo_etiquette","Face A"),("photo_face_b","Face B"),("photo_pochette","Pochette")]:
-                path = chosen.get(key)
-                if path:
-                    try: st.image(sb.storage.from_("disques-photos").create_signed_url(path,3600)["signedURL"], caption=caption, width=300)
-                    except Exception: pass
+            try:
+                with st.spinner("Enregistrement…"):
+                    did = str(uuid.uuid4())
+                    paths = {"photo_etiquette": f"{did}/etiquette.jpg", "photo_face_b": f"{did}/face_b.jpg",
+                             "photo_pochette": f"{did}/pochette.jpg" if cover_photo else None}
+                    upload_photo(paths["photo_etiquette"], face_a_photo)
+                    upload_photo(paths["photo_face_b"], face_b_photo)
+                    if cover_photo:
+                        upload_photo(paths["photo_pochette"], cover_photo)
+                    row = {"id": did, "created_at": datetime.now().astimezone().isoformat(),
+                           **{k: v.strip() for k, v in vals.items()}, "etat": state, "pochette": cover, **paths}
+                    sb.table("disques").insert(row).execute()
+                for k in ("ai_result", "ai_sig"):
+                    st.session_state.pop(k, None)
+                st.session_state.form_nonce = n + 1
+                st.session_state.just_saved = True
+                refresh()
+            except Exception as e:
+                st.error(f"Enregistrement impossible : {e}")
+
+# ---------------------------------------------------------------- Catalogue
+with tabs[1]:
+    if not records:
+        st.info("Aucun disque enregistré.")
+    else:
+        df = prepare(records)
+        f1, f2, f3, f4 = st.columns([3, 2, 2, 2])
+        with f1:
+            q = st.text_input("🔍 Rechercher", placeholder="titre, interprète, orchestre, auteur, référence…")
+        with f2:
+            labels = sorted(x for x in df["label_marque"].unique() if str(x).strip())
+            sel_labels = st.multiselect("Marque / label", labels)
+        with f3:
+            sel_etats = st.multiselect("État", ETATS)
+        with f4:
+            sel_poch = st.multiselect("Pochette", POCHETTES)
+        if q:
+            cols = FIELDS + ["Face A", "Face B"]
+            mask = df[cols].astype(str).apply(lambda c: c.str.contains(q, case=False, regex=False, na=False))
+            df = df[mask.any(axis=1)]
+        if sel_labels:
+            df = df[df["label_marque"].isin(sel_labels)]
+        if sel_etats:
+            df = df[df["etat"].isin(sel_etats)]
+        if sel_poch:
+            df = df[df["pochette"].isin(sel_poch)]
+
+        sort_keys = ["created_at", "Face A", "Face B", "titre_face_a", "interprete_face_a", "titre_face_b",
+                     "interprete_face_b", "orchestre", "auteurs", "label_marque", "reference_disque", "annee",
+                     "etat", "estimation_basse_eur", "estimation_haute_eur"]
+        o1, o2 = st.columns([3, 2])
+        with o1:
+            sort_by = st.selectbox("Trier par", sort_keys, format_func=LABELS.get, key="catalog_sort_by")
+        with o2:
+            desc = st.toggle("Ordre décroissant", value=(sort_by == "created_at"), key=f"desc_{sort_by}")
+        sort_series = {
+            "annee": df["_annee"], "estimation_basse_eur": df["_basse"], "estimation_haute_eur": df["_haute"],
+            "created_at": pd.to_datetime(df["created_at"], errors="coerce", utc=True),
+            "etat": df["etat"].map({e: i for i, e in enumerate(ETATS)}),
+        }.get(sort_by, df[sort_by].astype(str).str.casefold().where(lambda x: x != ""))
+        df = df.assign(_s=sort_series).sort_values("_s", ascending=not desc, na_position="last", kind="stable")
+
+        st.caption(f"{len(df)} disque(s) affiché(s) sur {len(records)} · valeur estimée "
+                   f"{fmt_eur(df['_basse'].sum(min_count=1))} – {fmt_eur(df['_haute'].sum(min_count=1))}")
+        visible = ["Face A", "Face B", "orchestre", "label_marque", "reference_disque", "annee", "etat",
+                   "pochette", "estimation_basse_eur", "estimation_haute_eur"]
+        event = st.dataframe(df[visible].rename(columns=LABELS), width="stretch", hide_index=True,
+                             on_select="rerun", selection_mode="single-row", key="catalog_table")
+        st.caption("Cliquez sur une ligne pour afficher la fiche détaillée.")
+
+        rows = event.selection.rows if event and hasattr(event, "selection") else []
+        if rows and rows[0] < len(df):
+            chosen = df.iloc[rows[0]].to_dict()
+            cid = chosen["id"]
+            st.divider()
+            st.subheader(f"💿 {chosen['Face A'] or 'Titre inconnu'}")
+            if chosen["Face B"]:
+                st.caption(f"Face B : {chosen['Face B']}")
+            info, pics = st.columns([2, 3])
+            with info:
+                for f in FIELDS + ["etat", "pochette"]:
+                    if f not in ("titre_face_a", "interprete_face_a", "titre_face_b", "interprete_face_b"):
+                        st.markdown(f"**{LABELS[f]} :** {chosen.get(f) or '—'}")
+            with pics:
+                pcols = st.columns(3)
+                for (key, _, caption), pc in zip(PHOTOS, pcols):
+                    if chosen.get(key):
+                        try:
+                            pc.image(signed_url(chosen[key]), caption=caption, width="stretch")
+                        except Exception:
+                            pc.caption(f"{caption} : photo indisponible")
+
             with st.expander("✏️ Modifier cette fiche"):
-                with st.form("edit_record_form"):
-                    edit_vals = {}
-                    left, right = st.columns(2)
-                    for i, field_name in enumerate(fields):
-                        with (left if i < 7 else right):
-                            current = str(chosen.get(field_name) or "")
-                            if field_name in ("notes", "identification_ia"):
-                                edit_vals[field_name] = st.text_area(field_name.replace("_", " ").capitalize(), value=current, height=80, key="edit_" + field_name)
-                            else:
-                                edit_vals[field_name] = st.text_input(field_name.replace("_", " ").capitalize(), value=current, key="edit_" + field_name)
-                    etats_edit = ["Très bon état", "Bon état", "État moyen", "Abîmé"]
-                    etat_actuel = chosen.get("etat") or "Très bon état"
-                    edit_etat = st.selectbox("État du disque", etats_edit, index=etats_edit.index(etat_actuel) if etat_actuel in etats_edit else 0)
-                    pochettes_edit = ["Oui", "Non", "À confirmer"]
-                    pochette_actuelle = chosen.get("pochette") or "À confirmer"
-                    edit_pochette = st.radio("Pochette présente ?", pochettes_edit, index=pochettes_edit.index(pochette_actuelle) if pochette_actuelle in pochettes_edit else 2, horizontal=True)
+                with st.form(f"edit_{cid}"):
+                    edit_vals = field_inputs(chosen, f"edit_{cid}")
+                    e1, e2 = st.columns(2)
+                    with e1:
+                        edit_etat = st.selectbox("État", ETATS, index=ETATS.index(chosen["etat"]) if chosen["etat"] in ETATS else 0)
+                    with e2:
+                        edit_poch = st.radio("Pochette présente ?", POCHETTES, horizontal=True,
+                                             index=POCHETTES.index(chosen["pochette"]) if chosen["pochette"] in POCHETTES else 2)
+                    st.markdown("**Remplacer une photo (facultatif)**")
+                    pc = st.columns(3)
+                    new_photos = {key: pc[i].file_uploader(cap, type=IMG_TYPES, key=f"rp_{key}_{cid}")
+                                  for i, (key, _, cap) in enumerate(PHOTOS)}
                     save_edit = st.form_submit_button("Enregistrer les modifications", type="primary")
                 if save_edit:
                     try:
-                        edit_vals["etat"] = edit_etat
-                        edit_vals["pochette"] = edit_pochette
-                        sb.table("disques").update(edit_vals).eq("id", chosen["id"]).execute()
-                        st.success("Modifications enregistrées.")
-                        st.rerun()
+                        upd = {k: v.strip() for k, v in edit_vals.items()} | {"etat": edit_etat, "pochette": edit_poch}
+                        for key, fname, _ in PHOTOS:
+                            if new_photos[key]:
+                                path = chosen.get(key) or f"{cid}/{fname}.jpg"
+                                upload_photo(path, new_photos[key])
+                                upd[key] = path
+                                signed_url.clear()
+                        sb.table("disques").update(upd).eq("id", cid).execute()
+                        st.toast("Modifications enregistrées.")
+                        refresh()
                     except Exception as e:
                         st.error(f"Modification impossible : {e}")
-            with st.expander("Supprimer cette fiche"):
-                st.warning("Cette action est définitive.")
-                if st.button("Confirmer la suppression", key="del"):
-                    for path in [chosen.get("photo_etiquette"),chosen.get("photo_face_b"),chosen.get("photo_pochette")]:
-                        if path:
-                            try: sb.storage.from_("disques-photos").remove([path])
-                            except Exception: pass
-                    sb.table("disques").delete().eq("id",chosen["id"]).execute(); st.rerun()
-    else: st.info("Aucun disque enregistré.")
-with tabs[2]:
-    if records:
-        df = pd.DataFrame(records).fillna("")
-        st.download_button("Télécharger le catalogue CSV pour Excel", df.to_csv(index=False).encode("utf-8-sig"), "ma_collection_78_tours.csv", "text/csv")
-    else: st.info("Ajoutez un disque pour commencer.")
 
-with tabs[3]:
-    st.subheader("État récapitulatif de la collection")
+            with st.expander("🗑️ Supprimer cette fiche"):
+                st.warning("Cette action est définitive : la fiche et ses photos seront effacées.")
+                sure = st.checkbox("Je confirme vouloir supprimer ce disque", key=f"sure_{cid}")
+                if st.button("Supprimer définitivement", disabled=not sure, key=f"del_{cid}"):
+                    try:
+                        paths = [chosen[k] for k, _, _ in PHOTOS if chosen.get(k)]
+                        if paths:
+                            try:
+                                sb.storage.from_(BUCKET).remove(paths)
+                            except Exception:
+                                pass
+                        sb.table("disques").delete().eq("id", cid).execute()
+                        st.toast("Disque supprimé.")
+                        refresh()
+                    except Exception as e:
+                        st.error(f"Suppression impossible : {e}")
+
+# ---------------------------------------------------------------- Récapitulatif
+with tabs[2]:
     if not records:
         st.info("Aucun disque enregistré : le récapitulatif apparaîtra dès le premier ajout.")
     else:
-        recap = pd.DataFrame(records).fillna("")
-        def euro_number(value):
-            if value is None: return None
-            s = str(value).strip().replace("€", "").replace(" ", "").replace(",", ".")
-            try: return float(s) if s else None
-            except (TypeError, ValueError): return None
+        recap = prepare(records)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Disques", len(recap))
+        m2.metric("Valeur estimée basse", fmt_eur(recap["_basse"].sum(min_count=1)))
+        m3.metric("Valeur estimée haute", fmt_eur(recap["_haute"].sum(min_count=1)))
+        m4.metric("Avec pochette", int((recap["pochette"] == "Oui").sum()))
+        st.caption("Montants indicatifs saisis ou proposés par l'IA : ce n'est ni une expertise ni une garantie de prix.")
 
-        for col in ["estimation_basse_eur", "estimation_haute_eur"]:
-            if col not in recap.columns:
-                recap[col] = None
-            recap[col + "_num"] = recap[col].apply(euro_number)
-        total = len(recap)
-        basse = recap["estimation_basse_eur_num"].sum(min_count=1)
-        haute = recap["estimation_haute_eur_num"].sum(min_count=1)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Nombre de disques", total)
-        c2.metric("Valeur estimée basse", "Non renseignée" if pd.isna(basse) else f"{basse:,.0f} €".replace(",", " "))
-        c3.metric("Valeur estimée haute", "Non renseignée" if pd.isna(haute) else f"{haute:,.0f} €".replace(",", " "))
-        st.caption("Les montants sont des estimations indicatives saisies ou proposées par l’IA, et non une expertise ni une garantie de prix de vente.")
+        def counts(col, empty, title):
+            s = recap[col].replace("", empty).value_counts()
+            return s.rename_axis(title).reset_index(name="Nombre")
 
-        st.markdown("#### État des disques")
-        etats = recap["etat"].replace("", "Non renseigné").value_counts().rename_axis("État").reset_index(name="Nombre")
-        st.dataframe(etats, use_container_width=True, hide_index=True)
+        g1, g2 = st.columns(2)
+        with g1:
+            st.markdown("#### État des disques")
+            etats = counts("etat", "Non renseigné", "État")
+            st.bar_chart(etats, x="État", y="Nombre", horizontal=True)
+        with g2:
+            st.markdown("#### Par décennie")
+            dec = recap["_annee"].dropna().astype(int) // 10 * 10
+            if len(dec):
+                dc = (dec.astype(str) + "s").value_counts().sort_index().rename_axis("Décennie").reset_index(name="Nombre")
+                st.bar_chart(dc, x="Décennie", y="Nombre")
+            else:
+                st.info("Aucune année renseignée.")
+            if recap["_annee"].isna().any():
+                st.caption(f"{int(recap['_annee'].isna().sum())} disque(s) sans année lisible.")
 
-        st.markdown("#### Présence des pochettes")
-        pochettes = recap["pochette"].replace("", "À confirmer").value_counts().rename_axis("Pochette").reset_index(name="Nombre")
-        st.dataframe(pochettes, use_container_width=True, hide_index=True)
+        g3, g4 = st.columns(2)
+        with g3:
+            st.markdown("#### Par marque / label")
+            st.dataframe(counts("label_marque", "Non renseigné", "Marque / label"), width="stretch", hide_index=True)
+        with g4:
+            st.markdown("#### Disques les plus estimés")
+            top = recap.dropna(subset=["_haute"]).nlargest(10, "_haute")
+            if len(top):
+                st.dataframe(top[["Face A", "label_marque", "estimation_basse_eur", "estimation_haute_eur"]]
+                             .rename(columns=LABELS), width="stretch", hide_index=True)
+            else:
+                st.info("Aucune estimation renseignée.")
 
-        st.markdown("#### Répartition par marque / label")
-        marques = recap["label_marque"].replace("", "Non renseigné").value_counts().rename_axis("Marque / label").reset_index(name="Nombre")
-        st.dataframe(marques, use_container_width=True, hide_index=True)
+        incomplete = recap[(recap["titre_face_a"] == "") | (recap["reference_disque"] == "") | (recap["_annee"].isna())]
+        if len(incomplete):
+            with st.expander(f"📝 {len(incomplete)} fiche(s) à compléter (titre, référence ou année manquant)"):
+                st.dataframe(incomplete[["Face A", "Face B", "label_marque", "reference_disque", "annee"]]
+                             .rename(columns=LABELS), width="stretch", hide_index=True)
 
-        st.markdown("#### Répartition par décennie")
-        annees = pd.to_numeric(recap.get("annee", pd.Series(index=recap.index, dtype="object")).astype(str).str.extract(r"(\\d{4})", expand=False), errors="coerce")
-        decades = (annees // 10 * 10).dropna().astype(int).astype(str) + "s"
-        if len(decades):
-            decade_counts = decades.value_counts().sort_index().rename_axis("Décennie").reset_index(name="Nombre")
-            st.dataframe(decade_counts, use_container_width=True, hide_index=True)
-        else:
-            st.info("Les années ne sont pas encore renseignées pour les disques.")
-
-        st.markdown("#### Liste récapitulative")
-        recap["Face A"] = recap.apply(lambda r: " — ".join(str(x) for x in [r.get("titre_face_a", ""), r.get("interprete_face_a", "")] if str(x or "").strip()), axis=1)
-        recap["Face B"] = recap.apply(lambda r: " — ".join(str(x) for x in [r.get("titre_face_b", ""), r.get("interprete_face_b", "")] if str(x or "").strip()), axis=1)
-        display_cols = ["Face A", "Face B", "label_marque", "reference_disque", "annee", "etat", "pochette", "estimation_basse_eur", "estimation_haute_eur"]
-        summary = recap[[col for col in display_cols if col in recap.columns]].copy()
-        st.dataframe(summary, use_container_width=True, hide_index=True)
-        st.download_button("Télécharger l’état récapitulatif (CSV pour Excel)", summary.to_csv(index=False).encode("utf-8-sig"), "etat_recapitulatif_78_tours.csv", "text/csv")
+# ---------------------------------------------------------------- Export
+with tabs[3]:
+    if not records:
+        st.info("Ajoutez un disque pour commencer.")
+    else:
+        out = export_frame(prepare(records))
+        stamp = datetime.now().strftime("%Y-%m-%d")
+        st.write(f"{len(out)} disques à exporter.")
+        x1, x2 = st.columns(2)
+        with x1:
+            try:
+                st.download_button("📗 Télécharger en Excel (.xlsx)", to_excel(out), f"collection_78_tours_{stamp}.xlsx",
+                                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary")
+            except ImportError:
+                st.caption("Ajoutez openpyxl à requirements.txt pour l'export Excel.")
+        with x2:
+            st.download_button("📄 Télécharger en CSV", out.to_csv(index=False, sep=";").encode("utf-8-sig"),
+                               f"collection_78_tours_{stamp}.csv", "text/csv")
+        st.caption("Le CSV utilise le point-virgule comme séparateur, pour s'ouvrir directement dans Excel en français.")
