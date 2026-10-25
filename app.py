@@ -49,7 +49,7 @@ def identify(upload_a, upload_b):
         raise ValueError("Clé Groq manquante dans les Secrets Streamlit. Ajoutez [groq] puis api_key.")
     raw_a = jpg_bytes(upload_a)
     raw_b = jpg_bytes(upload_b)
-    prompt = """Tu examines les deux photos d'un même disque 78 tours. La PREMIÈRE photo montre la FACE A et la DEUXIÈME photo montre la FACE B. Lis séparément les deux étiquettes et retranscris fidèlement les titres et interprètes de chaque face. Ne devine jamais un texte illisible : indique-le dans notes. Renseigne aussi le label, la référence, l'année si lisible, l'orchestre et les auteurs. Donne une estimation indicative de revente pour le disque complet en euros, sans la présenter comme une cote garantie. Réponds uniquement en JSON valide avec les champs: titre_face_a, titre_face_b, interprete_face_a, interprete_face_b, orchestre, auteurs, label_marque, reference_disque, annee, estimation_basse_eur, estimation_haute_eur, notes, identification_ia. Les valeurs peuvent être des chaînes de caractères."""
+    prompt = """Tu examines les deux photos d'un même disque 78 tours. La PREMIÈRE photo montre la FACE A et la DEUXIÈME photo montre la FACE B. Lis séparément les deux étiquettes et retranscris fidèlement les titres et interprètes de chaque face. Ne devine jamais un texte illisible : indique-le dans notes. Renseigne aussi le label, la référence, l'année si lisible, l'orchestre et les auteurs. Donne une estimation indicative de revente pour le disque complet en euros, sans la présenter comme une cote garantie. Sois très concis : chaque champ doit contenir une valeur courte, aucune explication hors JSON. Réponds uniquement en JSON valide avec les champs: titre_face_a, titre_face_b, interprete_face_a, interprete_face_b, orchestre, auteurs, label_marque, reference_disque, annee, estimation_basse_eur, estimation_haute_eur, notes, identification_ia. Les valeurs peuvent être des chaînes de caractères."""
     image_a = "data:image/jpeg;base64," + base64.b64encode(raw_a).decode("ascii")
     image_b = "data:image/jpeg;base64," + base64.b64encode(raw_b).decode("ascii")
     payload = {
@@ -62,7 +62,8 @@ def identify(upload_a, upload_b):
             {"type": "image_url", "image_url": {"url": image_b}}
         ]}],
         "temperature": 0.2,
-        "max_completion_tokens": 1600,
+        "max_completion_tokens": 900,
+        "reasoning_effort": "none",
         "response_format": {"type": "json_object"}
     }
     url = "https://api.groq.com/openai/v1/chat/completions"
