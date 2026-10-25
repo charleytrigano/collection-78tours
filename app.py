@@ -37,8 +37,8 @@ except Exception as e:
     st.code(str(e)); st.stop()
 
 st.title("💿 Ma collection de disques 78 tours")
-st.caption("Les photos et les fiches sont conservées dans Supabase. L’identification utilise Gemini, avec un quota gratuit limité.")
-api_key = secret("gemini","api_key")
+st.caption("Les photos et les fiches sont conservées dans Supabase. L’identification des deux faces utilise Groq (modèle Qwen vision).")
+api_key = secret("groq","api_key")
 
 def jpg_bytes(upload):
     im = Image.open(upload).convert("RGB"); im.thumbnail((1200,1200))
@@ -46,36 +46,45 @@ def jpg_bytes(upload):
 
 def identify(upload_a, upload_b):
     if not api_key:
-        raise ValueError("Clé Gemini manquante dans les Secrets Streamlit ([gemini] api_key).")
+        raise ValueError("Clé Groq manquante dans les Secrets Streamlit. Ajoutez [groq] puis api_key.")
     raw_a = jpg_bytes(upload_a)
     raw_b = jpg_bytes(upload_b)
-    prompt = """Tu examines les deux photos d'un même disque 78 tours. La PREMIÈRE photo montre la FACE A et la DEUXIÈME photo montre la FACE B. Lis séparément les deux étiquettes et retranscris fidèlement les titres et interprètes de chaque face. Ne devine jamais un texte illisible : indique-le dans notes. Renseigne aussi le label, la référence, l'année si lisible, l'orchestre et les auteurs. Donne une estimation indicative de revente pour le disque complet en euros, sans la présenter comme une cote garantie. Réponds uniquement en JSON avec les champs: titre_face_a, titre_face_b, interprete_face_a, interprete_face_b, orchestre, auteurs, label_marque, reference_disque, annee, estimation_basse_eur, estimation_haute_eur, notes, identification_ia."""
-    payload = {"contents": [{"parts": [
-        {"text": prompt},
-        {"text": "PHOTO 1 — FACE A"},
-        {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(raw_a).decode("ascii")}},
-        {"text": "PHOTO 2 — FACE B"},
-        {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(raw_b).decode("ascii")}}
-    ]}], "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}}
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
-    # Une seconde tentative peut suffire en cas de lenteur temporaire du service.
+    prompt = """Tu examines les deux photos d'un même disque 78 tours. La PREMIÈRE photo montre la FACE A et la DEUXIÈME photo montre la FACE B. Lis séparément les deux étiquettes et retranscris fidèlement les titres et interprètes de chaque face. Ne devine jamais un texte illisible : indique-le dans notes. Renseigne aussi le label, la référence, l'année si lisible, l'orchestre et les auteurs. Donne une estimation indicative de revente pour le disque complet en euros, sans la présenter comme une cote garantie. Réponds uniquement en JSON valide avec les champs: titre_face_a, titre_face_b, interprete_face_a, interprete_face_b, orchestre, auteurs, label_marque, reference_disque, annee, estimation_basse_eur, estimation_haute_eur, notes, identification_ia. Les valeurs peuvent être des chaînes de caractères."""
+    image_a = "data:image/jpeg;base64," + base64.b64encode(raw_a).decode("ascii")
+    image_b = "data:image/jpeg;base64," + base64.b64encode(raw_b).decode("ascii")
+    payload = {
+        "model": "qwen/qwen3.8-27b",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "text", "text": "PHOTO 1 — FACE A"},
+            {"type": "image_url", "image_url": {"url": image_a}},
+            {"type": "text", "text": "PHOTO 2 — FACE B"},
+            {"type": "image_url", "image_url": {"url": image_b}}
+        ]}],
+        "temperature": 0.2,
+        "max_completion_tokens": 1600,
+        "response_format": {"type": "json_object"}
+    }
+    url = "https://api.groq.com/openai/v1/chat/completions"
     last_error = None
     for attempt in range(2):
         try:
-            response = requests.post(url, params={"key": api_key}, json=payload, timeout=(15, 180))
+            response = requests.post(url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, json=payload, timeout=(15, 180))
             break
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             last_error = e
             if attempt == 1:
-                raise RuntimeError("Gemini ne répond toujours pas après deux tentatives. Attendez une minute puis réessayez, idéalement avec une photo plus rapprochée et nette.") from last_error
+                raise RuntimeError("Groq ne répond toujours pas après deux tentatives. Réessayez avec des photos plus rapprochées et nettes.") from last_error
     if response.status_code >= 400:
         try: detail = response.json().get("error", {}).get("message", response.text)
         except Exception: detail = response.text
-        raise RuntimeError(f"Gemini API ({response.status_code}) : {detail}")
+        if response.status_code == 429:
+            raise RuntimeError(f"Quota Groq temporairement dépassé : {detail}")
+        raise RuntimeError(f"Groq API ({response.status_code}) : {detail}")
     try:
-        return json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
+        return json.loads(response.json()["choices"][0]["message"]["content"])
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
-        raise RuntimeError("Gemini n'a pas renvoyé de réponse JSON exploitable. Réessayez avec une photo plus nette.") from e
+        raise RuntimeError("Groq n'a pas renvoyé de réponse JSON exploitable. Réessayez avec des photos plus nettes.") from e
 
 tabs = st.tabs(["➕ Ajouter un disque", "📚 Catalogue", "⬇️ Exporter", "📊 État récapitulatif"])
 fields = ["titre_face_a","interprete_face_a","titre_face_b","interprete_face_b","orchestre","auteurs","label_marque","reference_disque","annee","estimation_basse_eur","estimation_haute_eur","notes","identification_ia"]
