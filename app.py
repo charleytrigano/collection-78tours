@@ -176,15 +176,24 @@ Réponds UNIQUEMENT avec un objet JSON plat ayant exactement ces clés, valeurs 
 {"titre_face_a": "", "interprete_face_a": "", "titre_face_b": "", "interprete_face_b": "", "orchestre": "", "auteurs": "", "label_marque": "", "reference_disque": "", "annee": "", "estimation_basse_eur": "", "estimation_haute_eur": "", "notes": "", "identification_ia": ""}"""
 
 PROVIDERS = {
-    "Gemini (Google)": {"section": "gemini", "model": "gemini-3.8-flash",
+    # Chaque modèle Gemini gratuit a son propre quota journalier : on bascule sur le suivant quand l'un est épuisé.
+    "Gemini (Google)": {"section": "gemini",
+                        "models": ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
                         "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
                         "extra": {"max_tokens": 4000, "reasoning_effort": "low"}},
-    "Groq": {"section": "groq", "model": "qwen/qwen3.8-27b",
+    "Groq": {"section": "groq", "models": ["qwen/qwen3.8-27b"],
              "url": "https://api.groq.com/openai/v1/chat/completions",
              "extra": {"max_completion_tokens": 1500, "reasoning_effort": "none",
                        "response_format": {"type": "json_object"}}},
 }
-AVAILABLE = {name: {**p, "key": secret(p["section"], "api_key"), "model": secret(p["section"], "model", p["model"])}
+
+
+def _models(p):
+    custom = secret(p["section"], "model")
+    return ([custom] if custom else []) + [m for m in p["models"] if m != custom]
+
+
+AVAILABLE = {name: {**p, "key": secret(p["section"], "api_key"), "models": _models(p), "model": _models(p)[0]}
              for name, p in PROVIDERS.items() if secret(p["section"], "api_key")}
 
 
@@ -248,11 +257,43 @@ def api_error(response):
         return response.text
 
 
+class QuotaExhausted(Exception):
+    pass
+
+
+def _call(p, model, payload, provider):
+    """Un appel ; réessaie seulement les erreurs passagères (réseau, 5xx, limite par minute)."""
+    headers = {"Authorization": f"Bearer {p['key']}", "Content-Type": "application/json"}
+    for attempt in range(3):
+        try:
+            r = requests.post(p["url"], headers=headers, json={**payload, "model": model}, timeout=(15, 180))
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if attempt == 2:
+                raise RuntimeError(f"{provider} ne répond pas après trois tentatives. Réessayez plus tard.") from e
+            time.sleep(3 * (attempt + 1))
+            continue
+        if r.status_code == 429:
+            detail = api_error(r)
+            # Quota du jour épuisé : inutile d'attendre, chaque nouvel essai consommerait du quota.
+            if re.search(r"per ?day|perday|daily|exceeded your current quota", detail, re.IGNORECASE):
+                raise QuotaExhausted(detail)
+            m = re.search(r"(?:try again|retry) in ([0-9.]+)s", detail, re.IGNORECASE)
+            wait = float(m.group(1)) if m else 20
+            if attempt < 2 and wait <= 60:
+                time.sleep(max(2, wait + 1))
+                continue
+            raise QuotaExhausted(detail)
+        if r.status_code >= 500 and attempt < 2:
+            time.sleep(3)
+            continue
+        return r
+    return r
+
+
 def identify(provider, upload_a, upload_b):
     p = AVAILABLE[provider]
     img = lambda u: "data:image/jpeg;base64," + base64.b64encode(jpg_bytes(u, 2000)).decode("ascii")
     payload = {
-        "model": p["model"],
         "messages": [{"role": "user", "content": [
             {"type": "text", "text": PROMPT},
             {"type": "text", "text": "PHOTO 1 — FACE A"},
@@ -263,28 +304,24 @@ def identify(provider, upload_a, upload_b):
         "temperature": 0.1,
         **p["extra"],
     }
-    headers = {"Authorization": f"Bearer {p['key']}", "Content-Type": "application/json"}
-    response = None
-    for attempt in range(3):
+    skipped = []
+    for model in p["models"]:
         try:
-            response = requests.post(p["url"], headers=headers, json=payload, timeout=(15, 180))
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            if attempt == 2:
-                raise RuntimeError(f"{provider} ne répond pas après trois tentatives. Réessayez plus tard.") from e
-            time.sleep(3 * (attempt + 1))
+            response = _call(p, model, payload, provider)
+        except QuotaExhausted:
+            skipped.append(model)
             continue
-        if response.status_code == 429 and attempt < 2:
-            m = re.search(r"try again in ([0-9.]+)s", api_error(response), re.IGNORECASE)
-            time.sleep(min(60, max(2, int(float(m.group(1))) + 2)) if m else 20)
-            continue
-        if response.status_code >= 500 and attempt < 2:
-            time.sleep(3)
+        if response.status_code in (400, 404) and re.search(r"model|not found|not supported", api_error(response), re.I):
+            skipped.append(model)  # modèle retiré ou indisponible pour ce compte
             continue
         break
-    if response is None or response.status_code >= 400:
-        code = response.status_code if response is not None else "réseau"
-        detail = api_error(response) if response is not None else "Aucune réponse"
-        raise RuntimeError(f"{provider} ({code}) : {detail}")
+    else:
+        raise RuntimeError(f"Quota gratuit {provider} épuisé pour aujourd'hui sur tous les modèles "
+                           f"({', '.join(skipped)}). Il se réinitialise vers 9 h (heure de Paris)"
+                           + (", ou essayez l'autre IA." if len(AVAILABLE) > 1 else "."))
+    if response.status_code >= 400:
+        raise RuntimeError(f"{provider} ({response.status_code}) : {api_error(response)}")
+    st.session_state.ai_model = model
     try:
         raw = response.json()["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError, TypeError, ValueError):
@@ -388,7 +425,7 @@ with tabs[0]:
 
     result = st.session_state.get("ai_result", {})
     if any(result.values()):
-        st.success("Analyse terminée : relisez et corrigez les champs ci-dessous avant d'enregistrer.")
+        st.success(f"Analyse terminée ({st.session_state.get('ai_model', '')}) : relisez et corrigez les champs ci-dessous avant d'enregistrer.")
         dups = duplicates(result.get("reference_disque"))
         if dups:
             st.warning(f"⚠️ La référence « {result.get('reference_disque')} » existe déjà dans la collection "
