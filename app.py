@@ -521,22 +521,34 @@ with tabs[1]:
             chosen = df.iloc[rows[0]].to_dict()
             cid = chosen["id"]
             st.divider()
-            st.subheader(f"💿 {chosen['Face A'] or 'Titre inconnu'}")
-            if chosen["Face B"]:
-                st.caption(f"Face B : {chosen['Face B']}")
-            info, pics = st.columns([2, 3])
+            ref = " · ".join(x for x in (chosen.get("label_marque"), chosen.get("reference_disque"), chosen.get("annee")) if x)
+            st.subheader(f"💿 {ref or 'Disque'}")
+
+            def show_photo(key, caption):
+                if chosen.get(key):
+                    try:
+                        st.image(signed_url(chosen[key]), caption=caption, width="stretch")
+                    except Exception:
+                        st.caption(f"{caption} : photo indisponible")
+                else:
+                    st.caption(f"{caption} : pas de photo.")
+
+            fa, fb = st.columns(2, border=True)
+            for col, side, key in ((fa, "a", "photo_etiquette"), (fb, "b", "photo_face_b")):
+                with col:
+                    st.markdown(f"##### Face {side.upper()}")
+                    st.markdown(f"**{chosen.get(f'titre_face_{side}') or 'Titre inconnu'}**")
+                    st.write(chosen.get(f"interprete_face_{side}") or "Interprète inconnu")
+                    show_photo(key, f"Face {side.upper()}")
+
+            info, cover_col = st.columns([3, 1])
             with info:
-                for f in FIELDS + ["etat", "pochette"]:
-                    if f not in ("titre_face_a", "interprete_face_a", "titre_face_b", "interprete_face_b"):
-                        st.markdown(f"**{LABELS[f]} :** {chosen.get(f) or '—'}")
-            with pics:
-                pcols = st.columns(3)
-                for (key, _, caption), pc in zip(PHOTOS, pcols):
-                    if chosen.get(key):
-                        try:
-                            pc.image(signed_url(chosen[key]), caption=caption, width="stretch")
-                        except Exception:
-                            pc.caption(f"{caption} : photo indisponible")
+                for f in ("orchestre", "auteurs", "label_marque", "reference_disque", "annee", "etat", "pochette",
+                          "estimation_basse_eur", "estimation_haute_eur", "notes", "identification_ia"):
+                    st.markdown(f"**{LABELS[f]} :** {chosen.get(f) or '—'}")
+            with cover_col:
+                if chosen.get("photo_pochette"):
+                    show_photo("photo_pochette", "Pochette")
 
             with st.expander("✏️ Modifier cette fiche"):
                 with st.form(f"edit_{cid}"):
