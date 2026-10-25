@@ -14,8 +14,8 @@ ETATS = ["Très bon état", "Bon état", "État moyen", "Abîmé"]
 POCHETTES = ["Oui", "Non", "À confirmer"]
 FIELDS = ["titre_face_a", "interprete_face_a", "titre_face_b", "interprete_face_b", "orchestre", "auteurs",
           "label_marque", "reference_disque", "annee", "estimation_basse_eur", "estimation_haute_eur",
-          "notes", "identification_ia"]
-LONG_FIELDS = ("notes", "identification_ia")
+          "notes", "identification_ia", "presentation_face_a", "presentation_face_b"]
+LONG_FIELDS = ("notes", "identification_ia", "presentation_face_a", "presentation_face_b")
 LABELS = {
     "titre_face_a": "Titre face A", "interprete_face_a": "Interprète face A",
     "titre_face_b": "Titre face B", "interprete_face_b": "Interprète face B",
@@ -23,6 +23,7 @@ LABELS = {
     "reference_disque": "Référence", "annee": "Année",
     "estimation_basse_eur": "Estimation basse (€)", "estimation_haute_eur": "Estimation haute (€)",
     "notes": "Notes", "identification_ia": "Identification IA",
+    "presentation_face_a": "Présentation du morceau face A", "presentation_face_b": "Présentation du morceau face B",
     "etat": "État", "pochette": "Pochette", "created_at": "Date d'ajout", "id": "Identifiant",
     "Face A": "Face A", "Face B": "Face B",
 }
@@ -154,7 +155,7 @@ def to_excel(df):
 def export_frame(df):
     cols = ["titre_face_a", "interprete_face_a", "titre_face_b", "interprete_face_b", "orchestre", "auteurs",
             "label_marque", "reference_disque", "annee", "etat", "pochette", "estimation_basse_eur",
-            "estimation_haute_eur", "notes", "created_at"]
+            "estimation_haute_eur", "notes", "presentation_face_a", "presentation_face_b", "created_at"]
     return df[cols].rename(columns=LABELS)
 
 
@@ -171,9 +172,15 @@ Lis attentivement le texte imprimé sur chaque étiquette (y compris le texte co
 - estimation_basse_eur / estimation_haute_eur : estimation indicative de revente du disque en euros, nombre seul.
 - notes : ce qui est illisible ou incertain, numéros de matrice, mentions utiles.
 - identification_ia : une phrase sur ton niveau de confiance.
+- presentation_face_a / presentation_face_b : 3 à 5 phrases en français présentant le morceau de chaque face (genre, contexte, histoire de l'œuvre ou de l'enregistrement, intérêt pour un collectionneur). Uniquement des faits dont tu es sûr ; si tu ne connais pas le morceau, dis-le simplement.
 N'invente rien : si un texte est illisible, laisse le champ vide et signale-le dans notes.
 Réponds UNIQUEMENT avec un objet JSON plat ayant exactement ces clés, valeurs en chaînes de caractères :
-{"titre_face_a": "", "interprete_face_a": "", "titre_face_b": "", "interprete_face_b": "", "orchestre": "", "auteurs": "", "label_marque": "", "reference_disque": "", "annee": "", "estimation_basse_eur": "", "estimation_haute_eur": "", "notes": "", "identification_ia": ""}"""
+{"titre_face_a": "", "interprete_face_a": "", "titre_face_b": "", "interprete_face_b": "", "orchestre": "", "auteurs": "", "label_marque": "", "reference_disque": "", "annee": "", "estimation_basse_eur": "", "estimation_haute_eur": "", "notes": "", "identification_ia": "", "presentation_face_a": "", "presentation_face_b": ""}"""
+
+PRESENT_PROMPT = """Tu es un spécialiste de la musique enregistrée sur 78 tours. Voici la fiche d'un disque de ma collection :
+{fiche}
+Pour chacune des deux faces, écris 3 à 5 phrases en français présentant le morceau : genre, contexte, histoire de l'œuvre ou de cet enregistrement, musiciens notables, intérêt pour un collectionneur. N'écris que des faits dont tu es sûr ; si tu ne connais pas un morceau, dis-le simplement en une phrase.
+Réponds UNIQUEMENT en JSON : {{"presentation_face_a": "", "presentation_face_b": ""}}"""
 
 PROVIDERS = {
     # Chaque modèle Gemini gratuit a son propre quota journalier : on bascule sur le suivant quand l'un est épuisé.
@@ -290,20 +297,10 @@ def _call(p, model, payload, provider):
     return r
 
 
-def identify(provider, upload_a, upload_b):
+def ask_ai(provider, content, max_tokens=None):
+    """Envoie la demande au premier modèle disponible du fournisseur et renvoie le texte brut."""
     p = AVAILABLE[provider]
-    img = lambda u: "data:image/jpeg;base64," + base64.b64encode(jpg_bytes(u, 2000)).decode("ascii")
-    payload = {
-        "messages": [{"role": "user", "content": [
-            {"type": "text", "text": PROMPT},
-            {"type": "text", "text": "PHOTO 1 — FACE A"},
-            {"type": "image_url", "image_url": {"url": img(upload_a)}},
-            {"type": "text", "text": "PHOTO 2 — FACE B"},
-            {"type": "image_url", "image_url": {"url": img(upload_b)}},
-        ]}],
-        "temperature": 0.1,
-        **p["extra"],
-    }
+    payload = {"messages": [{"role": "user", "content": content}], "temperature": 0.1, **p["extra"]}
     skipped = []
     for model in p["models"]:
         try:
@@ -323,9 +320,20 @@ def identify(provider, upload_a, upload_b):
         raise RuntimeError(f"{provider} ({response.status_code}) : {api_error(response)}")
     st.session_state.ai_model = model
     try:
-        raw = response.json()["choices"][0]["message"]["content"] or ""
+        return response.json()["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError, TypeError, ValueError):
-        raw = response.text
+        return response.text
+
+
+def identify(provider, upload_a, upload_b):
+    img = lambda u: "data:image/jpeg;base64," + base64.b64encode(jpg_bytes(u, 2000)).decode("ascii")
+    raw = ask_ai(provider, [
+        {"type": "text", "text": PROMPT},
+        {"type": "text", "text": "PHOTO 1 — FACE A"},
+        {"type": "image_url", "image_url": {"url": img(upload_a)}},
+        {"type": "text", "text": "PHOTO 2 — FACE B"},
+        {"type": "image_url", "image_url": {"url": img(upload_b)}},
+    ])
     st.session_state.ai_raw = raw
     try:
         return normalize_result(parse_json(raw))
@@ -333,12 +341,25 @@ def identify(provider, upload_a, upload_b):
         raise RuntimeError(f"{provider} n'a pas renvoyé de JSON exploitable (voir la réponse brute ci-dessous).") from e
 
 
+def present(provider, rec):
+    """Rédige la présentation des deux morceaux d'un disque déjà enregistré (texte seul, sans photo)."""
+    keys = ["titre_face_a", "interprete_face_a", "titre_face_b", "interprete_face_b", "orchestre", "auteurs",
+            "label_marque", "reference_disque", "annee"]
+    fiche = "\n".join(f"- {LABELS[k]} : {rec.get(k)}" for k in keys if rec.get(k))
+    raw = ask_ai(provider, PRESENT_PROMPT.format(fiche=fiche))
+    try:
+        data = normalize_result(parse_json(raw))
+    except (json.JSONDecodeError, TypeError, AttributeError) as e:
+        raise RuntimeError(f"{provider} n'a pas renvoyé de réponse exploitable.") from e
+    return {k: data[k] for k in ("presentation_face_a", "presentation_face_b")}
+
+
 # ---------------------------------------------------------------- Formulaire commun
 def field_inputs(source, prefix):
     vals = {}
     left, right = st.columns(2)
     for i, f in enumerate(FIELDS):
-        with (left if i < 7 else right):
+        with (left if i < (len(FIELDS) + 1) // 2 else right):
             current = str(source.get(f) or "")
             if f in LONG_FIELDS:
                 vals[f] = st.text_area(LABELS[f], value=current, height=90, key=f"{prefix}_{f}")
@@ -539,7 +560,23 @@ with tabs[1]:
                     st.markdown(f"##### Face {side.upper()}")
                     st.markdown(f"**{chosen.get(f'titre_face_{side}') or 'Titre inconnu'}**")
                     st.write(chosen.get(f"interprete_face_{side}") or "Interprète inconnu")
+                    if chosen.get(f"presentation_face_{side}"):
+                        st.info(chosen[f"presentation_face_{side}"], icon="🎵")
                     show_photo(key, f"Face {side.upper()}")
+
+            if AVAILABLE and not (chosen.get("presentation_face_a") and chosen.get("presentation_face_b")):
+                if st.button("✨ Présenter les morceaux avec l'IA", key=f"present_{cid}"):
+                    try:
+                        prov = st.session_state.get("provider") or next(iter(AVAILABLE))
+                        with st.spinner(f"Rédaction de la présentation avec {prov}…"):
+                            pres = present(prov, chosen)
+                        if not any(pres.values()):
+                            st.warning("L'IA n'a rien pu dire sur ces morceaux.")
+                        else:
+                            sb.table("disques").update(pres).eq("id", cid).execute()
+                            refresh()
+                    except Exception as e:
+                        st.error(f"Présentation impossible : {e}")
 
             info, cover_col = st.columns([3, 1])
             with info:
