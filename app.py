@@ -44,12 +44,19 @@ def jpg_bytes(upload):
     im = Image.open(upload).convert("RGB"); im.thumbnail((1200,1200))
     b = io.BytesIO(); im.save(b, "JPEG", quality=78, optimize=True); return b.getvalue()
 
-def identify(upload):
+def identify(upload_a, upload_b):
     if not api_key:
         raise ValueError("Clé Gemini manquante dans les Secrets Streamlit ([gemini] api_key).")
-    raw = jpg_bytes(upload)
-    prompt = """Lis cette étiquette de disque 78 tours. Transcris fidèlement les éléments visibles et ne devine pas les éléments illisibles. Donne une estimation indicative de revente en euros, sans présenter cela comme une cote garantie. Réponds uniquement en JSON avec les champs: titre_face_a, titre_face_b, interprete_face_a, interprete_face_b, orchestre, auteurs, label_marque, reference_disque, annee, estimation_basse_eur, estimation_haute_eur, notes, identification_ia."""
-    payload = {"contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(raw).decode("ascii")}}]}], "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}}
+    raw_a = jpg_bytes(upload_a)
+    raw_b = jpg_bytes(upload_b)
+    prompt = """Tu examines les deux photos d'un même disque 78 tours. La PREMIÈRE photo montre la FACE A et la DEUXIÈME photo montre la FACE B. Lis séparément les deux étiquettes et retranscris fidèlement les titres et interprètes de chaque face. Ne devine jamais un texte illisible : indique-le dans notes. Renseigne aussi le label, la référence, l'année si lisible, l'orchestre et les auteurs. Donne une estimation indicative de revente pour le disque complet en euros, sans la présenter comme une cote garantie. Réponds uniquement en JSON avec les champs: titre_face_a, titre_face_b, interprete_face_a, interprete_face_b, orchestre, auteurs, label_marque, reference_disque, annee, estimation_basse_eur, estimation_haute_eur, notes, identification_ia."""
+    payload = {"contents": [{"parts": [
+        {"text": prompt},
+        {"text": "PHOTO 1 — FACE A"},
+        {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(raw_a).decode("ascii")}},
+        {"text": "PHOTO 2 — FACE B"},
+        {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(raw_b).decode("ascii")}}
+    ]}], "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2}}
     url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
     # Une seconde tentative peut suffire en cas de lenteur temporaire du service.
     last_error = None
@@ -73,18 +80,22 @@ def identify(upload):
 tabs = st.tabs(["➕ Ajouter un disque", "📚 Catalogue", "⬇️ Exporter", "📊 État récapitulatif"])
 fields = ["titre_face_a","interprete_face_a","titre_face_b","interprete_face_b","orchestre","auteurs","label_marque","reference_disque","annee","estimation_basse_eur","estimation_haute_eur","notes","identification_ia"]
 with tabs[0]:
+    st.write("Photographiez les deux étiquettes du même disque. L’IA les analysera ensemble pour créer une seule fiche.")
     c1,c2 = st.columns(2)
-    with c1: label_photo = st.file_uploader("Photo nette de l'étiquette", type=["jpg","jpeg","png","webp"], key="label")
-    with c2: cover_photo = st.file_uploader("Photo de la pochette (facultatif)", type=["jpg","jpeg","png","webp"], key="cover")
-    face_selection = st.radio("Face photographiée / renseignée", ["Face A", "Face B"], horizontal=True, key="new_face")
+    with c1: face_a_photo = st.file_uploader("📷 Photo de la face A (obligatoire)", type=["jpg","jpeg","png","webp"], key="face_a_photo")
+    with c2: face_b_photo = st.file_uploader("📷 Photo de la face B (obligatoire)", type=["jpg","jpeg","png","webp"], key="face_b_photo")
+    cover_photo = st.file_uploader("Photo de la pochette (facultatif)", type=["jpg","jpeg","png","webp"], key="cover")
+    if face_a_photo:
+        with c1: st.image(face_a_photo, caption="Face A", width=280)
+    if face_b_photo:
+        with c2: st.image(face_b_photo, caption="Face B", width=280)
     state = st.selectbox("État", ["Très bon état","Bon état","État moyen","Abîmé"])
     cover = st.radio("Pochette présente ?", ["Oui","Non","À confirmer"], horizontal=True)
-    if label_photo:
-        st.image(label_photo, width=300)
-        if st.button("🔎 Identifier gratuitement avec Gemini", type="primary", disabled=not api_key):
-            try:
-                with st.spinner("Analyse de l'étiquette…"): st.session_state.ai_result = identify(label_photo)
-            except Exception as e: st.error(f"Erreur IA : {e}")
+    if st.button("🔎 Analyser les deux faces avec Gemini", type="primary", disabled=(not api_key or not face_a_photo or not face_b_photo)):
+        try:
+            with st.spinner("Analyse des deux faces… cela peut prendre un peu de temps."):
+                st.session_state.ai_result = identify(face_a_photo, face_b_photo)
+        except Exception as e: st.error(f"Erreur IA : {e}")
     result = st.session_state.get("ai_result", {})
     with st.form("new_record"):
         st.subheader("Vérifiez les informations avant l'enregistrement")
@@ -95,17 +106,22 @@ with tabs[0]:
                 default = str(result.get(f,"") or "")
                 vals[f] = st.text_area(f.replace("_"," ").capitalize(), value=default, height=70 if f in ("notes","identification_ia") else 40) if f in ("notes","identification_ia") else st.text_input(f.replace("_"," ").capitalize(), value=default)
         if st.form_submit_button("Enregistrer le disque", type="primary"):
-            if not label_photo: st.error("Ajoutez une photo d'étiquette.")
+            if not face_a_photo or not face_b_photo:
+                st.error("Ajoutez les photos des faces A et B.")
             else:
                 try:
                     did = str(uuid.uuid4())
-                    p1 = f"{did}/etiquette.jpg"; sb.storage.from_("disques-photos").upload(p1, jpg_bytes(label_photo), {"content-type":"image/jpeg","upsert":"true"})
+                    p1 = f"{did}/etiquette.jpg"
+                    sb.storage.from_("disques-photos").upload(p1, jpg_bytes(face_a_photo), {"content-type":"image/jpeg","upsert":"true"})
+                    p_face_b = f"{did}/face_b.jpg"
+                    sb.storage.from_("disques-photos").upload(p_face_b, jpg_bytes(face_b_photo), {"content-type":"image/jpeg","upsert":"true"})
                     p2 = None
                     if cover_photo:
-                        p2 = f"{did}/pochette.jpg"; sb.storage.from_("disques-photos").upload(p2, jpg_bytes(cover_photo), {"content-type":"image/jpeg","upsert":"true"})
-                    payload = {"id":did, "created_at":datetime.now().astimezone().isoformat(), **vals, "etat":state, "face_selection":face_selection, "pochette":cover, "photo_etiquette":p1, "photo_pochette":p2}
+                        p2 = f"{did}/pochette.jpg"
+                        sb.storage.from_("disques-photos").upload(p2, jpg_bytes(cover_photo), {"content-type":"image/jpeg","upsert":"true"})
+                    payload = {"id":did, "created_at":datetime.now().astimezone().isoformat(), **vals, "etat":state, "pochette":cover, "photo_etiquette":p1, "photo_face_b":p_face_b, "photo_pochette":p2}
                     sb.table("disques").insert(payload).execute()
-                    st.session_state.pop("ai_result",None); st.success("Disque enregistré."); st.rerun()
+                    st.session_state.pop("ai_result",None); st.success("Disque enregistré avec les deux faces."); st.rerun()
                 except Exception as e: st.error(f"Enregistrement impossible : {e}")
 with tabs[1]:
     if records:
@@ -121,7 +137,7 @@ with tabs[1]:
             chosen = st.selectbox("Détail du disque", options, format_func=lambda r:f"{r.get('titre_face_a') or 'Titre inconnu'} — {r.get('interprete_face_a') or 'Interprète inconnu'}", key="chosen")
             for f in fields + ["etat","pochette"]:
                 st.write(f"**{f.replace('_',' ').capitalize()} :** {chosen.get(f) or '—'}")
-            for key,caption in [("photo_etiquette","Étiquette"),("photo_pochette","Pochette")]:
+            for key,caption in [("photo_etiquette","Face A"),("photo_face_b","Face B"),("photo_pochette","Pochette")]:
                 path = chosen.get(key)
                 if path:
                     try: st.image(sb.storage.from_("disques-photos").create_signed_url(path,3600)["signedURL"], caption=caption, width=300)
@@ -137,9 +153,6 @@ with tabs[1]:
                                 edit_vals[field_name] = st.text_area(field_name.replace("_", " ").capitalize(), value=current, height=80, key="edit_" + field_name)
                             else:
                                 edit_vals[field_name] = st.text_input(field_name.replace("_", " ").capitalize(), value=current, key="edit_" + field_name)
-                    faces_edit = ["Face A", "Face B"]
-                    face_actuelle = chosen.get("face_selection") or "Face A"
-                    edit_face = st.radio("Face photographiée / renseignée", faces_edit, index=faces_edit.index(face_actuelle) if face_actuelle in faces_edit else 0, horizontal=True)
                     etats_edit = ["Très bon état", "Bon état", "État moyen", "Abîmé"]
                     etat_actuel = chosen.get("etat") or "Très bon état"
                     edit_etat = st.selectbox("État du disque", etats_edit, index=etats_edit.index(etat_actuel) if etat_actuel in etats_edit else 0)
@@ -149,7 +162,6 @@ with tabs[1]:
                     save_edit = st.form_submit_button("Enregistrer les modifications", type="primary")
                 if save_edit:
                     try:
-                        edit_vals["face_selection"] = edit_face
                         edit_vals["etat"] = edit_etat
                         edit_vals["pochette"] = edit_pochette
                         sb.table("disques").update(edit_vals).eq("id", chosen["id"]).execute()
@@ -160,7 +172,7 @@ with tabs[1]:
             with st.expander("Supprimer cette fiche"):
                 st.warning("Cette action est définitive.")
                 if st.button("Confirmer la suppression", key="del"):
-                    for path in [chosen.get("photo_etiquette"),chosen.get("photo_pochette")]:
+                    for path in [chosen.get("photo_etiquette"),chosen.get("photo_face_b"),chosen.get("photo_pochette")]:
                         if path:
                             try: sb.storage.from_("disques-photos").remove([path])
                             except Exception: pass
