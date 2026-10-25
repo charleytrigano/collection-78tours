@@ -131,7 +131,43 @@ with tabs[1]:
         df["Face A"] = df.apply(lambda r: " — ".join(str(x) for x in [r.get("titre_face_a", ""), r.get("interprete_face_a", "")] if str(x or "").strip()), axis=1)
         df["Face B"] = df.apply(lambda r: " — ".join(str(x) for x in [r.get("titre_face_b", ""), r.get("interprete_face_b", "")] if str(x or "").strip()), axis=1)
         cols = ["Face A", "Face B", "orchestre", "auteurs", "label_marque", "reference_disque", "annee", "etat", "pochette", "estimation_basse_eur", "estimation_haute_eur"]
-        st.dataframe(df[[col for col in cols if col in df.columns]], use_container_width=True, hide_index=True)
+        visible_cols = [col for col in cols if col in df.columns]
+        st.markdown("#### Trier le catalogue")
+        sort_labels = {
+            "Face A": "Face A — titre / interprète",
+            "Face B": "Face B — titre / interprète",
+            "titre_face_a": "Titre face A",
+            "interprete_face_a": "Interprète face A",
+            "titre_face_b": "Titre face B",
+            "interprete_face_b": "Interprète face B",
+            "orchestre": "Orchestre",
+            "auteurs": "Auteurs",
+            "label_marque": "Marque / label",
+            "reference_disque": "Référence",
+            "annee": "Année",
+            "etat": "État",
+            "pochette": "Pochette",
+            "estimation_basse_eur": "Estimation basse (€)",
+            "estimation_haute_eur": "Estimation haute (€)",
+            "notes": "Notes",
+            "identification_ia": "Identification IA",
+            "created_at": "Date d'ajout",
+            "id": "Identifiant"
+        }
+        sort_keys = [key for key in sort_labels if key in df.columns]
+        sort_c1, sort_c2 = st.columns([3, 2])
+        with sort_c1:
+            sort_by = st.selectbox("Trier par", sort_keys, format_func=lambda key: sort_labels[key], key="catalog_sort_by")
+        with sort_c2:
+            sort_order = st.radio("Ordre", ["Croissant (A → Z / plus petit au plus grand)", "Décroissant (Z → A / plus grand au plus petit)"], horizontal=False, key="catalog_sort_order")
+        if sort_by in ("annee", "estimation_basse_eur", "estimation_haute_eur"):
+            df["_sort_value"] = pd.to_numeric(df[sort_by].astype(str).str.replace("€", "", regex=False).str.replace(",", ".", regex=False), errors="coerce")
+        elif sort_by == "created_at":
+            df["_sort_value"] = pd.to_datetime(df[sort_by], errors="coerce", utc=True)
+        else:
+            df["_sort_value"] = df[sort_by].astype(str).str.casefold()
+        df = df.sort_values("_sort_value", ascending=sort_order.startswith("Croissant"), na_position="last", kind="stable").drop(columns=["_sort_value"])
+        st.dataframe(df[visible_cols], use_container_width=True, hide_index=True)
         options = df.to_dict("records")
         if options:
             chosen = st.selectbox("Détail du disque", options, format_func=lambda r:f"{r.get('titre_face_a') or 'Titre inconnu'} — {r.get('interprete_face_a') or 'Interprète inconnu'}", key="chosen")
