@@ -1,4 +1,4 @@
-import base64, io, json, uuid
+import base64, io, json, uuid, time, re
 from datetime import datetime
 import pandas as pd
 import streamlit as st
@@ -67,21 +67,32 @@ def identify(upload_a, upload_b):
         "response_format": {"type": "json_object"}
     }
     url = "https://api.groq.com/openai/v1/chat/completions"
-    last_error = None
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    response = None
     for attempt in range(2):
         try:
-            response = requests.post(url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, json=payload, timeout=(15, 180))
-            break
+            response = requests.post(url, headers=headers, json=payload, timeout=(15, 180))
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            last_error = e
             if attempt == 1:
-                raise RuntimeError("Groq ne répond toujours pas après deux tentatives. Réessayez avec des photos plus rapprochées et nettes.") from last_error
-    if response.status_code >= 400:
-        try: detail = response.json().get("error", {}).get("message", response.text)
-        except Exception: detail = response.text
-        if response.status_code == 429:
-            raise RuntimeError(f"Quota Groq temporairement dépassé : {detail}")
-        raise RuntimeError(f"Groq API ({response.status_code}) : {detail}")
+                raise RuntimeError("Groq ne répond toujours pas après deux tentatives. Réessayez.") from e
+            time.sleep(3)
+            continue
+        if response.status_code == 429 and attempt == 0:
+            try:
+                detail = response.json().get("error", {}).get("message", response.text)
+            except Exception:
+                detail = response.text
+            match = re.search(r"try again in ([0-9.]+)s", detail, re.IGNORECASE)
+            wait_seconds = min(60, max(2, int(float(match.group(1))) + 2)) if match else 30
+            time.sleep(wait_seconds)
+            continue
+        break
+    if response is None or response.status_code >= 400:
+        try: detail = response.json().get("error", {}).get("message", response.text) if response is not None else "Aucune réponse de Groq"
+        except Exception: detail = response.text if response is not None else "Aucune réponse de Groq"
+        if response is not None and response.status_code == 429:
+            raise RuntimeError(f"Limite Groq toujours atteinte après une attente automatique : {detail}")
+        raise RuntimeError(f"Groq API ({response.status_code if response is not None else 'erreur réseau'}) : {detail}")
     try:
         return json.loads(response.json()["choices"][0]["message"]["content"])
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
@@ -101,7 +112,7 @@ with tabs[0]:
         with c2: st.image(face_b_photo, caption="Face B", width=280)
     state = st.selectbox("État", ["Très bon état","Bon état","État moyen","Abîmé"])
     cover = st.radio("Pochette présente ?", ["Oui","Non","À confirmer"], horizontal=True)
-    if st.button("🔎 Analyser les deux faces avec Gemini", type="primary", disabled=(not api_key or not face_a_photo or not face_b_photo)):
+    if st.button("🔎 Analyser les deux faces avec Groq", type="primary", disabled=(not api_key or not face_a_photo or not face_b_photo)):
         try:
             with st.spinner("Analyse des deux faces… cela peut prendre un peu de temps."):
                 st.session_state.ai_result = identify(face_a_photo, face_b_photo)
