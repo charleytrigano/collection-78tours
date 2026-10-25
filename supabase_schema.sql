@@ -13,3 +13,5 @@ alter table public.disques enable row level security;
 insert into storage.buckets (id,name,public) values ('disques-photos','disques-photos',false) on conflict (id) do nothing;
 
 alter table public.disques add column if not exists photo_face_b text;
+alter table public.disques add column if not exists presentation_face_a text;
+alter table public.disques add column if not exists presentation_face_b text;
