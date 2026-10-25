@@ -686,10 +686,57 @@ with tabs[2]:
                              .rename(columns=LABELS), width="stretch", hide_index=True)
 
 # ---------------------------------------------------------------- Export
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=500)
+def photo_bytes(path):
+    try:
+        return sb.storage.from_(BUCKET).download(path)
+    except Exception:
+        return None
+
+
 with tabs[3]:
     if not records:
         st.info("Ajoutez un disque pour commencer.")
     else:
+        st.markdown("#### 📖 Catalogue PDF")
+        st.caption("À imprimer, à envoyer à un acheteur ou à un expert. Choisissez ce qu'il contient :")
+        k1, k2, k3 = st.columns(3)
+        with k1:
+            cat_prices = st.toggle("Avec les prix estimés", value=True, key="cat_prices")
+        with k2:
+            cat_photos = st.toggle("Avec les photos", value=True, key="cat_photos")
+        with k3:
+            cat_pres = st.toggle("Avec la présentation des morceaux", value=False, key="cat_pres")
+        k4, k5 = st.columns(2)
+        with k4:
+            cat_title = st.text_input("Titre du catalogue", value="Ma collection de 78 tours", key="cat_title")
+        with k5:
+            cat_sort = st.selectbox("Ordre des disques", ["label_marque", "reference_disque", "titre_face_a",
+                                                          "interprete_face_a", "annee", "created_at"],
+                                    format_func=LABELS.get, key="cat_sort")
+        cat_df = prepare(records)
+        cat_df = cat_df.assign(_s=cat_df["_annee"] if cat_sort == "annee" else
+                               cat_df[cat_sort].astype(str).str.casefold().where(lambda x: x != "")) \
+                       .sort_values(["_s", "reference_disque"], na_position="last", kind="stable")
+        if st.button("Préparer le catalogue PDF", type="primary", key="cat_build"):
+            try:
+                from catalogue_pdf import build_catalogue
+                with st.spinner("Mise en page du catalogue" + (" et récupération des photos…" if cat_photos else "…")):
+                    st.session_state.cat_pdf = build_catalogue(cat_df, cat_prices, cat_photos, cat_pres, cat_title,
+                                                               load_photo=photo_bytes)
+                    st.session_state.cat_opts = (cat_prices, cat_photos, cat_pres)
+            except Exception as e:
+                st.error(f"Catalogue impossible : {e}")
+        if st.session_state.get("cat_pdf"):
+            pr, ph, pz = st.session_state.cat_opts
+            name = "catalogue_78_tours" + ("" if pr else "_sans_prix") + ("" if ph else "_sans_photos")
+            st.download_button("⬇️ Télécharger le catalogue PDF", st.session_state.cat_pdf,
+                               f"{name}_{datetime.now():%Y-%m-%d}.pdf", "application/pdf", key="cat_dl")
+            st.caption(f"Contenu : {'avec' if pr else 'sans'} prix · {'avec' if ph else 'sans'} photos"
+                       f"{' · avec présentations' if pz else ''}.")
+
+        st.divider()
+        st.markdown("#### 📊 Tableur")
         out = export_frame(prepare(records))
         stamp = datetime.now().strftime("%Y-%m-%d")
         st.write(f"{len(out)} disques à exporter.")
