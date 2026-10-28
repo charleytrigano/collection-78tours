@@ -741,8 +741,13 @@ with tabs[1]:
         st.caption(f"{len(df)} disque(s) affiché(s) sur {len(records)} · valeur estimée "
                    f"{fmt_eur(df['_basse'].sum(min_count=1))} – {fmt_eur(df['_haute'].sum(min_count=1))}")
         visible = ["Face A", "Face B", "orchestre", "label_marque", "reference_disque", "annee", "etat",
-                   "pochette", "estimation_basse_eur", "estimation_haute_eur", "Écoutes"]
+                   "pochette", "estimation_basse_eur", "estimation_haute_eur", "Écoutes",
+                   "presentation_face_a", "presentation_face_b"]
+        pres_cfg = {LABELS[f"presentation_face_{x}"]: st.column_config.TextColumn(
+            f"Présentation face {x.upper()}", width="large",
+            help="Survolez ou double-cliquez une cellule pour lire le texte entier") for x in ("a", "b")}
         event = st.dataframe(df[visible].rename(columns=LABELS), width="stretch", hide_index=True,
+                             column_config=pres_cfg,
                              on_select="rerun", selection_mode="single-row", key="catalog_table")
         st.caption("Cliquez sur une ligne pour afficher la fiche détaillée.")
 
