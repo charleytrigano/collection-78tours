@@ -4,6 +4,7 @@ from datetime import datetime
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image, ImageOps
 from supabase import create_client
 
@@ -124,6 +125,21 @@ def face(r, side):
                       if str(r.get(k) or "").strip())
 
 
+def ecoutes(value):
+    """Liste des écoutes d'une face : [{"url", "nom", "ajout"}]. Accepte l'ancien format (un seul lien)."""
+    if isinstance(value, list):
+        return value
+    v = str(value or "").strip()
+    if not v:
+        return []
+    if v.startswith("["):
+        try:
+            return [i for i in json.loads(v) if isinstance(i, dict) and i.get("url")]
+        except json.JSONDecodeError:
+            return []
+    return [{"url": v, "nom": ""}]
+
+
 def prepare(recs):
     df = pd.DataFrame(recs)
     for c in FIELDS + ["etat", "pochette", "created_at", "id"] + [p[0] for p in PHOTOS] + ["ecoute_face_a", "ecoute_face_b"]:
@@ -137,6 +153,7 @@ def prepare(recs):
     # Une seule estimation saisie → elle sert de borne basse ET haute (évite un total bas > total haut).
     df["_basse"], df["_haute"] = df["_basse"].fillna(df["_haute"]), df["_haute"].fillna(df["_basse"])
     df["_annee"] = df["annee"].apply(year_number)
+    df["Écoutes"] = df["ecoute_face_a"].apply(lambda v: len(ecoutes(v))) + df["ecoute_face_b"].apply(lambda v: len(ecoutes(v)))
     return df
 
 
@@ -156,7 +173,11 @@ def export_frame(df):
     cols = ["titre_face_a", "interprete_face_a", "titre_face_b", "interprete_face_b", "orchestre", "auteurs",
             "label_marque", "reference_disque", "annee", "etat", "pochette", "estimation_basse_eur",
             "estimation_haute_eur", "notes", "presentation_face_a", "presentation_face_b", "created_at"]
-    return df[cols].rename(columns=LABELS)
+    out = df[cols].rename(columns=LABELS)
+    for side in ("a", "b"):
+        out[f"Écoutes face {side.upper()}"] = df[f"ecoute_face_{side}"].apply(
+            lambda v: "\n".join(i["url"] for i in ecoutes(v) if i["url"].startswith("http")))
+    return out
 
 
 # ---------------------------------------------------------------- IA (Gemini ou Groq)
@@ -443,39 +464,99 @@ def archive_search(title, artist):
     return results
 
 
-def play(source):
-    """Joue une écoute enregistrée : lien YouTube, lien audio direct, ou fichier déposé dans Supabase."""
-    if not source:
-        return
-    if re.search(r"youtube\.com|youtu\.be", source):
-        st.video(source)
-    elif source.startswith("http"):
-        st.audio(source)
-        if "archive.org/download/" in source:
-            st.caption(f"[Source : Internet Archive]({source.rsplit('/', 1)[0].replace('/download/', '/details/')})")
+def yt_id(url):
+    m = re.search(r"(?:youtube\.com/(?:watch\?(?:.*&)?v=|embed/|shorts/|live/)|youtu\.be/)([\w-]{11})", url or "")
+    return m.group(1) if m else None
+
+
+def clean_url(url):
+    """Nettoie un lien : YouTube réduit à la seule vidéo (supprime &list=RD…, &start_radio…)."""
+    url = (url or "").strip()
+    vid = yt_id(url)
+    if vid:
+        t = re.search(r"[?&]t=(\d+)", url)
+        return f"https://www.youtube.com/watch?v={vid}" + (f"&t={t.group(1)}" if t else "")
+    return url
+
+
+def kind_of(src):
+    if yt_id(src):
+        return "YouTube"
+    for dom, name in (("youtube.com", "YouTube"), ("spotify.com", "Spotify"), ("deezer.com", "Deezer"),
+                      ("archive.org", "Internet Archive"), ("soundcloud.com", "SoundCloud"), ("gallica", "Gallica")):
+        if dom in (src or ""):
+            return name
+    return "Lien" if str(src).startswith("http") else "Mon enregistrement"
+
+
+def play(item, height=None):
+    """Lit une écoute : vidéo YouTube, Spotify / Deezer intégrés, MP3 direct ou fichier déposé."""
+    src = item["url"]
+    vid = yt_id(src)
+    sp = re.search(r"open\.spotify\.com/(?:intl-\w+/)?(track|album|playlist)/(\w+)", src)
+    dz = re.search(r"deezer\.com/(?:\w{2}/)?(track|album|playlist)/(\d+)", src)
+    if vid:
+        st.video(f"https://www.youtube.com/watch?v={vid}")
+    elif sp:
+        components.iframe(f"https://open.spotify.com/embed/{sp.group(1)}/{sp.group(2)}", height=152)
+    elif dz:
+        components.iframe(f"https://widget.deezer.com/widget/auto/{dz.group(1)}/{dz.group(2)}", height=152)
+    elif src.startswith("http") and re.search(r"\.(mp3|ogg|wav|m4a|flac|aac)(\?|$)|archive\.org/download/", src, re.I):
+        st.audio(src)
+    elif src.startswith("http"):
+        st.link_button("Ouvrir le lien ↗", src)  # page de chaîne, playlist… : pas de lecteur possible
     else:
         try:
-            st.audio(signed_url(source))
+            st.audio(signed_url(src))
         except Exception:
             st.caption("Fichier audio indisponible.")
 
 
-def save_ecoute(cid, side, value):
-    sb.table("disques").update({f"ecoute_face_{side}": value}).eq("id", cid).execute()
-    st.toast("Écoute enregistrée." if value else "Écoute retirée.")
+def save_ecoutes(cid, side, items, msg):
+    sb.table("disques").update({f"ecoute_face_{side}": json.dumps(items, ensure_ascii=False) if items else None}) \
+        .eq("id", cid).execute()
+    st.toast(msg)
     refresh()
+
+
+def add_ecoute(rec, side, url, nom=""):
+    items = ecoutes(rec.get(f"ecoute_face_{side}"))
+    url = clean_url(url)
+    if any(clean_url(i["url"]) == url for i in items):
+        st.warning("Ce lien est déjà enregistré pour cette face.")
+        return
+    items.append({"url": url, "nom": nom.strip() or kind_of(url), "ajout": datetime.now().strftime("%Y-%m-%d")})
+    save_ecoutes(rec["id"], side, items, "Écoute ajoutée.")
 
 
 def ecoute_panel(rec, side):
     cid, title, artist = rec["id"], rec.get(f"titre_face_{side}") or "", rec.get(f"interprete_face_{side}") or ""
-    current = rec.get(f"ecoute_face_{side}") or ""
-    st.markdown("**🎧 Écouter**")
-    play(current)
+    items = ecoutes(rec.get(f"ecoute_face_{side}"))
+    st.markdown(f"**🎧 Écouter** ({len(items)})" if items else "**🎧 Écouter**")
+    for i, item in enumerate(items):
+        top, rm = st.columns([5, 1])
+        top.caption(f"{i + 1}. {item.get('nom') or kind_of(item['url'])}")
+        if rm.button("🗑️", key=f"rm_{cid}_{side}_{i}", help="Supprimer cette écoute"):
+            if not item["url"].startswith("http"):
+                try:
+                    sb.storage.from_(BUCKET).remove([item["url"]])
+                except Exception:
+                    pass
+            save_ecoutes(cid, side, items[:i] + items[i + 1:], "Écoute supprimée.")
+        play(item)
     q = requests.utils.quote(f"{title} {artist}".strip())
     if q:
-        st.caption(f"[YouTube](https://www.youtube.com/results?search_query={q}) · "
+        st.caption(f"Chercher : [YouTube](https://www.youtube.com/results?search_query={q}) · "
                    f"[Spotify](https://open.spotify.com/search/{q}) · [Deezer](https://www.deezer.com/search/{q})")
-    with st.expander("Trouver ou ajouter une écoute" if not current else "Changer l'écoute"):
+    with st.expander("➕ Ajouter une écoute"):
+        with st.form(f"lnkf_{cid}_{side}", clear_on_submit=True, border=False):
+            link = st.text_input("Lien (YouTube, Spotify, Deezer, archive.org, MP3…)")
+            nom = st.text_input("Nom (facultatif)", placeholder="ex. version originale 1939, reprise…")
+            if st.form_submit_button("💾 Enregistrer ce lien", type="primary"):
+                if link.strip().startswith("http"):
+                    add_ecoute(rec, side, link, nom)
+                else:
+                    st.error("Le lien doit commencer par http.")
         if title and st.button("🔎 Chercher ce 78 tours sur Internet Archive", key=f"ia_{cid}_{side}"):
             st.session_state[f"ia_res_{cid}_{side}"] = None
             try:
@@ -485,35 +566,23 @@ def ecoute_panel(rec, side):
                 st.error(f"Recherche impossible : {e}")
         res = st.session_state.get(f"ia_res_{cid}_{side}")
         if res == []:
-            st.info("Aucun enregistrement trouvé. Essayez les liens YouTube / Spotify / Deezer ci-dessus.")
+            st.info("Aucun enregistrement trouvé sur Internet Archive.")
         for i, r in enumerate(res or []):
             st.markdown(f"**{r['title']}** — {r['creator']} {('(' + r['date'] + ')') if r['date'] else ''}  \n"
                         f"[Voir sur archive.org]({r['page']})")
             st.audio(r["mp3"])
-            if st.button("✅ Garder cette version", key=f"keep_{cid}_{side}_{i}"):
-                save_ecoute(cid, side, r["mp3"])
-        st.divider()
-        link = st.text_input("Ou collez un lien (YouTube, archive.org, fichier .mp3…)", key=f"lnk_{cid}_{side}")
-        if st.button("Enregistrer ce lien", key=f"lnkb_{cid}_{side}", disabled=not link.startswith("http")):
-            save_ecoute(cid, side, link.strip())
+            if st.button("➕ Ajouter cette version", key=f"keep_{cid}_{side}_{i}"):
+                add_ecoute(rec, side, r["mp3"], f"Internet Archive – {r['title']}"[:80])
         up = st.file_uploader("Ou déposez votre propre enregistrement", type=AUDIO_TYPES, key=f"aud_{cid}_{side}")
-        if up and st.button("Enregistrer ce fichier", key=f"audb_{cid}_{side}"):
+        if up and st.button("💾 Enregistrer ce fichier", key=f"audb_{cid}_{side}"):
             try:
                 ext = up.name.rsplit(".", 1)[-1].lower()
-                path = f"{cid}/audio_face_{side}.{ext}"
+                path = f"{cid}/audio_face_{side}_{uuid.uuid4().hex[:6]}.{ext}"
                 sb.storage.from_(BUCKET).upload(path, up.getvalue(), {"content-type": up.type or f"audio/{ext}",
                                                                       "upsert": "true"})
-                signed_url.clear()
-                save_ecoute(cid, side, path)
+                add_ecoute(rec, side, path, up.name.rsplit(".", 1)[0])
             except Exception as e:
                 st.error(f"Envoi impossible : {e}")
-        if current and st.button("Retirer l'écoute", key=f"rm_{cid}_{side}"):
-            if not current.startswith("http"):
-                try:
-                    sb.storage.from_(BUCKET).remove([current])
-                except Exception:
-                    pass
-            save_ecoute(cid, side, None)
 
 
 # ---------------------------------------------------------------- En-tête
@@ -672,7 +741,7 @@ with tabs[1]:
         st.caption(f"{len(df)} disque(s) affiché(s) sur {len(records)} · valeur estimée "
                    f"{fmt_eur(df['_basse'].sum(min_count=1))} – {fmt_eur(df['_haute'].sum(min_count=1))}")
         visible = ["Face A", "Face B", "orchestre", "label_marque", "reference_disque", "annee", "etat",
-                   "pochette", "estimation_basse_eur", "estimation_haute_eur"]
+                   "pochette", "estimation_basse_eur", "estimation_haute_eur", "Écoutes"]
         event = st.dataframe(df[visible].rename(columns=LABELS), width="stretch", hide_index=True,
                              on_select="rerun", selection_mode="single-row", key="catalog_table")
         st.caption("Cliquez sur une ligne pour afficher la fiche détaillée.")
@@ -763,8 +832,8 @@ with tabs[1]:
                 if st.button("Supprimer définitivement", disabled=not sure, key=f"del_{cid}"):
                     try:
                         paths = [chosen[k] for k, _, _ in PHOTOS if chosen.get(k)]
-                        paths += [chosen[k] for k in ("ecoute_face_a", "ecoute_face_b")
-                                  if chosen.get(k) and not str(chosen[k]).startswith("http")]
+                        paths += [i["url"] for k in ("ecoute_face_a", "ecoute_face_b") for i in ecoutes(chosen.get(k))
+                                  if not i["url"].startswith("http")]
                         if paths:
                             try:
                                 sb.storage.from_(BUCKET).remove(paths)
