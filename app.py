@@ -126,7 +126,7 @@ def face(r, side):
 
 def prepare(recs):
     df = pd.DataFrame(recs)
-    for c in FIELDS + ["etat", "pochette", "created_at", "id"] + [p[0] for p in PHOTOS]:
+    for c in FIELDS + ["etat", "pochette", "created_at", "id"] + [p[0] for p in PHOTOS] + ["ecoute_face_a", "ecoute_face_b"]:
         if c not in df.columns:
             df[c] = ""
     df = df.fillna("")
@@ -376,6 +376,146 @@ def duplicates(ref, exclude_id=None):
             and r.get("id") != exclude_id]
 
 
+# ---------------------------------------------------------------- Écoute
+AUDIO_TYPES = ["mp3", "wav", "m4a", "ogg", "flac", "aac"]
+IA_HEADERS = {"User-Agent": "collection-78tours (catalogue personnel)"}
+STOP = {"et", "son", "sa", "ses", "orchestre", "avec", "de", "du", "des", "la", "le", "les", "and", "his", "her",
+        "orchestra", "the", "with", "a", "l", "d", "en", "on", "of", "in", "chant", "piano",
+        "est", "un", "une", "mon", "ton", "pas", "que", "qui", "pour", "dans", "sur", "you", "and", "for"}
+
+
+def _words(text, keep=4):
+    """Mots significatifs d'un titre : « J'ai deux amours » → deux, amours ; « L'amour » → amour."""
+    text = str(text or "").replace("\u2019", "'").replace("\u2018", "'").replace("`", "'").replace("œ", "oe").replace("Œ", "Oe")
+    ascii_ = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode().lower()
+    out = []
+    for tok in ascii_.replace("-", " ").split():
+        parts = [x for x in re.split(r"'", tok)]
+        if len(parts) > 1 and parts[-1] in ("t", "s", "ll", "re", "ve", "d", "m"):
+            continue  # contraction anglaise (don't, it's…) : mal indexée, on l'ignore
+        tok = parts[-1] if len(parts) > 1 and len(parts[0]) <= 2 else parts[0]  # l'amour → amour ; shufflin' → shufflin
+        tok = re.sub(r"[^a-z]", "", tok)
+        if len(tok) >= 3 and tok not in STOP:
+            out.append(tok)
+    return out[:keep]
+
+
+def _main_artist(text):
+    """« Lionel Hampton et son orchestre » → « hampton » (nom le plus probable)."""
+    head = re.split(r"\s+(?:et|and|avec|with|&)\s+|,|/", str(text or ""), maxsplit=1)[0]
+    ws = _words(head, 6)
+    return ws[-1] if ws else ""
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def archive_search(title, artist):
+    """Cherche le morceau dans le Great 78 Project (Internet Archive) et renvoie les MP3 jouables."""
+    tw = _words(title)
+    if not tw:
+        return []
+    base = "collection:georgeblood AND title:(" + " AND ".join(tw) + ")"
+    who = _main_artist(artist)
+    docs = []
+    for q in ([f"{base} AND {who}"] if who else []) + [base]:
+        r = requests.get("https://archive.org/advancedsearch.php", headers=IA_HEADERS, timeout=20,
+                         params={"q": q, "fl[]": ["identifier", "title", "creator", "date"], "rows": 6,
+                                 "output": "json", "sort[]": "downloads desc"})
+        r.raise_for_status()
+        docs = r.json().get("response", {}).get("docs", [])
+        if docs:
+            break
+    results = []
+    for d in docs:
+        ident = d.get("identifier")
+        try:
+            files = requests.get(f"https://archive.org/metadata/{ident}", headers=IA_HEADERS, timeout=20).json().get("files", [])
+        except Exception:
+            continue
+        mp3s = sorted((f["name"] for f in files if "mp3" in str(f.get("format", "")).lower() or
+                       str(f.get("name", "")).lower().endswith(".mp3")), key=len)
+        if mp3s:
+            creator = d.get("creator")
+            results.append({"title": d.get("title", ident),
+                            "creator": ", ".join(creator) if isinstance(creator, list) else (creator or ""),
+                            "date": str(d.get("date", ""))[:4],
+                            "mp3": f"https://archive.org/download/{ident}/{requests.utils.quote(mp3s[0])}",
+                            "page": f"https://archive.org/details/{ident}"})
+    return results
+
+
+def play(source):
+    """Joue une écoute enregistrée : lien YouTube, lien audio direct, ou fichier déposé dans Supabase."""
+    if not source:
+        return
+    if re.search(r"youtube\.com|youtu\.be", source):
+        st.video(source)
+    elif source.startswith("http"):
+        st.audio(source)
+        if "archive.org/download/" in source:
+            st.caption(f"[Source : Internet Archive]({source.rsplit('/', 1)[0].replace('/download/', '/details/')})")
+    else:
+        try:
+            st.audio(signed_url(source))
+        except Exception:
+            st.caption("Fichier audio indisponible.")
+
+
+def save_ecoute(cid, side, value):
+    sb.table("disques").update({f"ecoute_face_{side}": value}).eq("id", cid).execute()
+    st.toast("Écoute enregistrée." if value else "Écoute retirée.")
+    refresh()
+
+
+def ecoute_panel(rec, side):
+    cid, title, artist = rec["id"], rec.get(f"titre_face_{side}") or "", rec.get(f"interprete_face_{side}") or ""
+    current = rec.get(f"ecoute_face_{side}") or ""
+    st.markdown("**🎧 Écouter**")
+    play(current)
+    q = requests.utils.quote(f"{title} {artist}".strip())
+    if q:
+        st.caption(f"[YouTube](https://www.youtube.com/results?search_query={q}) · "
+                   f"[Spotify](https://open.spotify.com/search/{q}) · [Deezer](https://www.deezer.com/search/{q})")
+    with st.expander("Trouver ou ajouter une écoute" if not current else "Changer l'écoute"):
+        if title and st.button("🔎 Chercher ce 78 tours sur Internet Archive", key=f"ia_{cid}_{side}"):
+            st.session_state[f"ia_res_{cid}_{side}"] = None
+            try:
+                with st.spinner("Recherche dans les 78 tours numérisés de l'Internet Archive…"):
+                    st.session_state[f"ia_res_{cid}_{side}"] = archive_search(title, artist)
+            except Exception as e:
+                st.error(f"Recherche impossible : {e}")
+        res = st.session_state.get(f"ia_res_{cid}_{side}")
+        if res == []:
+            st.info("Aucun enregistrement trouvé. Essayez les liens YouTube / Spotify / Deezer ci-dessus.")
+        for i, r in enumerate(res or []):
+            st.markdown(f"**{r['title']}** — {r['creator']} {('(' + r['date'] + ')') if r['date'] else ''}  \n"
+                        f"[Voir sur archive.org]({r['page']})")
+            st.audio(r["mp3"])
+            if st.button("✅ Garder cette version", key=f"keep_{cid}_{side}_{i}"):
+                save_ecoute(cid, side, r["mp3"])
+        st.divider()
+        link = st.text_input("Ou collez un lien (YouTube, archive.org, fichier .mp3…)", key=f"lnk_{cid}_{side}")
+        if st.button("Enregistrer ce lien", key=f"lnkb_{cid}_{side}", disabled=not link.startswith("http")):
+            save_ecoute(cid, side, link.strip())
+        up = st.file_uploader("Ou déposez votre propre enregistrement", type=AUDIO_TYPES, key=f"aud_{cid}_{side}")
+        if up and st.button("Enregistrer ce fichier", key=f"audb_{cid}_{side}"):
+            try:
+                ext = up.name.rsplit(".", 1)[-1].lower()
+                path = f"{cid}/audio_face_{side}.{ext}"
+                sb.storage.from_(BUCKET).upload(path, up.getvalue(), {"content-type": up.type or f"audio/{ext}",
+                                                                      "upsert": "true"})
+                signed_url.clear()
+                save_ecoute(cid, side, path)
+            except Exception as e:
+                st.error(f"Envoi impossible : {e}")
+        if current and st.button("Retirer l'écoute", key=f"rm_{cid}_{side}"):
+            if not current.startswith("http"):
+                try:
+                    sb.storage.from_(BUCKET).remove([current])
+                except Exception:
+                    pass
+            save_ecoute(cid, side, None)
+
+
 # ---------------------------------------------------------------- En-tête
 head, logout = st.columns([6, 1])
 with head:
@@ -563,6 +703,7 @@ with tabs[1]:
                     if chosen.get(f"presentation_face_{side}"):
                         st.info(chosen[f"presentation_face_{side}"], icon="🎵")
                     show_photo(key, f"Face {side.upper()}")
+                    ecoute_panel(chosen, side)
 
             if AVAILABLE and not (chosen.get("presentation_face_a") and chosen.get("presentation_face_b")):
                 if st.button("✨ Présenter les morceaux avec l'IA", key=f"present_{cid}"):
@@ -622,6 +763,8 @@ with tabs[1]:
                 if st.button("Supprimer définitivement", disabled=not sure, key=f"del_{cid}"):
                     try:
                         paths = [chosen[k] for k, _, _ in PHOTOS if chosen.get(k)]
+                        paths += [chosen[k] for k in ("ecoute_face_a", "ecoute_face_b")
+                                  if chosen.get(k) and not str(chosen[k]).startswith("http")]
                         if paths:
                             try:
                                 sb.storage.from_(BUCKET).remove(paths)
