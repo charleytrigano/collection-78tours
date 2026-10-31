@@ -526,25 +526,83 @@ def run(cfg):
                              .reset_index(name="Nombre"), x="Décennie", y="Nombre")
 
     # ------------------------------------------------------------ Export
-    @st.cache_data(ttl=3600, show_spinner=False, max_entries=500)
-    def photo_bytes(path):
-        try:
-            return db().storage.from_(BUCKET).download(path)
-        except Exception:
+    def fetch_photo(path):
+        """Octets d'une photo stockée : téléchargement direct, sinon via un lien signé."""
+        if not path:
             return None
+        try:
+            data = db().storage.from_(BUCKET).download(path)
+            if isinstance(data, (bytes, bytearray)) and len(data) > 100:
+                return bytes(data)
+        except Exception:
+            pass
+        try:
+            r = requests.get(signed_url(path), timeout=30)
+            if r.ok and len(r.content) > 100:
+                return r.content
+        except Exception:
+            pass
+        return None
+
+    @st.cache_data(ttl=3600, show_spinner=False, max_entries=1000)
+    def photo_bytes(path):
+        return fetch_photo(path)
+
+    def excel_with_photos(df, photo_col):
+        """Classeur Excel avec une miniature de la photo dans la première colonne de chaque ligne."""
+        from openpyxl import Workbook
+        from openpyxl.drawing.image import Image as XLImage
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from PIL import Image as PILImage
+        wb = Workbook()
+        ws = wb.active
+        ws.title = cfg["pdf_title"][:31]
+        cols = [c for c in df.columns if not str(c).startswith("_") and c != photo_col]
+        ws.append(["Photo"] + cols)
+        for c in ws[1]:
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = PatternFill("solid", fgColor="1F1A17")
+        ws.column_dimensions["A"].width = 14
+        for i, col in enumerate(cols, start=2):
+            letter = ws.cell(row=1, column=i).column_letter
+            wide = col in (LAB.get(cfg["text_field"]), LAB.get("pistes"), LAB.get("notes"))
+            ws.column_dimensions[letter].width = 60 if wide else 18
+        for r_i, row in enumerate(df.to_dict("records"), start=2):
+            ws.append([""] + [str(row.get(c) or "") for c in cols])
+            ws.row_dimensions[r_i].height = 84
+            for cell in ws[r_i]:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+            data = photo_bytes(row.get(photo_col)) if row.get(photo_col) else None
+            if data:
+                try:
+                    im = PILImage.open(io.BytesIO(data)).convert("RGB")
+                    im.thumbnail((140, 110))
+                    b = io.BytesIO()
+                    im.save(b, "PNG")
+                    b.seek(0)
+                    xl = XLImage(b)
+                    ws.add_image(xl, f"A{r_i}")
+                except Exception:
+                    pass
+        ws.freeze_panes = "B2"
+        out = io.BytesIO()
+        wb.save(out)
+        return out.getvalue()
 
     with tabs[3]:
         if not records:
             st.info(f"Ajoutez {cfg['un']} pour commencer.")
         else:
-            st.markdown("#### 📖 Catalogue PDF")
+            st.markdown("### 📖 Édition PDF du catalogue")
+            st.caption(f"Une fiche par {cfg['item']} avec la photo, les informations et {cfg['text_art']} — "
+                       "à imprimer ou à envoyer.")
             k1, k2, k3 = st.columns(3)
             with k1:
-                wp = st.toggle("Avec les prix estimés", value=True, key=f"{P}_cp")
+                wph = st.toggle("Avec les photos", value=True, key=f"{P}_cph2")
             with k2:
-                wph = st.toggle("Avec les photos", value=True, key=f"{P}_cph")
+                wt = st.toggle(f"Avec {cfg['text_art']}", value=True, key=f"{P}_ct2")
             with k3:
-                wt = st.toggle(f"Avec {cfg['text_art']}", value=False, key=f"{P}_ct")
+                wp = st.toggle("Avec les prix estimés", value=True, key=f"{P}_cp2")
             k4, k5 = st.columns(2)
             with k4:
                 title = st.text_input("Titre du catalogue", value=cfg["pdf_title"], key=f"{P}_ctitle")
@@ -554,29 +612,56 @@ def run(cfg):
             cdf = cdf.assign(_s=cdf["_annee"] if order == "annee" else
                              cdf[order].astype(str).str.casefold().where(lambda x: x != "")) \
                      .sort_values("_s", na_position="last", kind="stable")
-            if st.button("Préparer le catalogue PDF", type="primary", key=f"{P}_cbuild"):
+            photo_col, tf = cfg["pdf"]["photo"], cfg["text_field"]
+            n_ph = int((cdf[photo_col].astype(str).str.strip() != "").sum())
+            n_tx = int((cdf[tf].astype(str).str.strip() != "").sum())
+            st.caption(f"{len(cdf)} fiche(s) · {n_ph} avec photo · {n_tx} avec {cfg['text_art'].split(' ', 1)[1]}.")
+            if st.button("📄 Créer l'édition PDF", type="primary", key=f"{P}_cbuild"):
                 try:
                     from catalogue_pdf import build_generic
-                    with st.spinner("Mise en page…"):
+                    got, missing = [], []
+
+                    def loader(path):
+                        data = photo_bytes(path)
+                        (got if data else missing).append(path)
+                        return data
+                    with st.spinner("Mise en page" + (" et récupération des photos…" if wph else "…")):
                         st.session_state[f"{P}_pdf"] = build_generic(cdf, cfg["pdf"], wp, wph, wt, title,
-                                                                     load_photo=photo_bytes)
-                        st.session_state[f"{P}_pdf_opts"] = (wp, wph)
+                                                                     load_photo=loader)
+                        st.session_state[f"{P}_pdf_opts"] = (wp, wph, wt, len(got), len(missing))
                 except Exception as e:
-                    st.error(f"Catalogue impossible : {e}")
+                    st.error(f"Édition PDF impossible : {e}")
             if st.session_state.get(f"{P}_pdf"):
-                pr, ph = st.session_state[f"{P}_pdf_opts"]
+                pr, ph, tx, ok_n, miss_n = st.session_state[f"{P}_pdf_opts"]
                 name = f"catalogue_{cfg['table']}" + ("" if pr else "_sans_prix") + ("" if ph else "_sans_photos")
-                st.download_button("⬇️ Télécharger le catalogue PDF", st.session_state[f"{P}_pdf"],
-                                   f"{name}_{datetime.now():%Y-%m-%d}.pdf", "application/pdf", key=f"{P}_cdl")
+                st.download_button("⬇️ Télécharger l'édition PDF", st.session_state[f"{P}_pdf"],
+                                   f"{name}_{datetime.now():%Y-%m-%d}.pdf", "application/pdf", key=f"{P}_cdl",
+                                   type="primary")
+                st.caption(f"Contenu : {'avec' if ph else 'sans'} photos ({ok_n} incluses) · "
+                           f"{'avec' if tx else 'sans'} {cfg['text_art'].split(' ', 1)[1]} · {'avec' if pr else 'sans'} prix.")
+                if miss_n:
+                    st.warning(f"{miss_n} photo(s) n'ont pas pu être récupérées depuis le stockage.")
+
             st.divider()
-            st.markdown("#### 📊 Tableur")
-            out = prepare(records)[KEYS + ["created_at"]].rename(columns=LAB)
+            st.markdown("### 📊 Tableur")
+            prep = prepare(records)
+            out = prep[KEYS + ["created_at"] + [photo_col]].rename(columns={k: v for k, v in LAB.items() if k != photo_col})
             if cfg.get("ecoutes"):
                 out["Écoutes"] = [", ".join(i["url"] for i in ecoutes(v) if i["url"].startswith("http"))
-                                  for v in prepare(records)["ecoutes"]]
+                                  for v in prep["ecoutes"]]
             stamp = datetime.now().strftime("%Y-%m-%d")
-            x1, x2 = st.columns(2)
-            x1.download_button("📗 Excel (.xlsx)", to_excel(out), f"{cfg['table']}_{stamp}.xlsx",
+            x1, x2, x3 = st.columns(3)
+            with x1:
+                if st.button("📗 Préparer l'Excel avec photos", key=f"{P}_xlp"):
+                    with st.spinner("Insertion des photos dans le classeur…"):
+                        st.session_state[f"{P}_xlsx"] = excel_with_photos(out, photo_col)
+                if st.session_state.get(f"{P}_xlsx"):
+                    st.download_button("⬇️ Excel avec photos", st.session_state[f"{P}_xlsx"],
+                                       f"{cfg['table']}_photos_{stamp}.xlsx",
+                                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                       key=f"{P}_xlpd")
+            plain = out.drop(columns=[photo_col])
+            x2.download_button("📗 Excel simple (.xlsx)", to_excel(plain), f"{cfg['table']}_{stamp}.xlsx",
                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{P}_xl")
-            x2.download_button("📄 CSV", out.to_csv(index=False, sep=";").encode("utf-8-sig"),
+            x3.download_button("📄 CSV", plain.to_csv(index=False, sep=";").encode("utf-8-sig"),
                                f"{cfg['table']}_{stamp}.csv", "text/csv", key=f"{P}_csv")
