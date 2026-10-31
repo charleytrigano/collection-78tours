@@ -17,3 +17,25 @@ alter table public.disques add column if not exists presentation_face_a text;
 alter table public.disques add column if not exists presentation_face_b text;
 alter table public.disques add column if not exists ecoute_face_a text;
 alter table public.disques add column if not exists ecoute_face_b text;
+
+-- CDthèque
+create table if not exists public.cds (
+ id uuid primary key default gen_random_uuid(),
+ created_at timestamptz not null default now(),
+ artiste text, titre text, label text, annee text, genre text, format text, reference text, code_barres text,
+ nb_disques text, pistes text, etat text, emplacement text, notes text, presentation text,
+ estimation_basse_eur text, estimation_haute_eur text, identification_ia text,
+ photo_recto text, photo_verso text, ecoutes text
+);
+alter table public.cds enable row level security;
+
+-- Bibliothèque
+create table if not exists public.livres (
+ id uuid primary key default gen_random_uuid(),
+ created_at timestamptz not null default now(),
+ titre text, auteur text, editeur text, collection text, annee text, isbn text, langue text, genre text,
+ format text, pages text, edition text, etat text, emplacement text, lu text, pret text, notes text, resume text,
+ estimation_basse_eur text, estimation_haute_eur text, identification_ia text,
+ photo_couverture text, photo_dos text
+);
+alter table public.livres enable row level security;
