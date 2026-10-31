@@ -4,7 +4,7 @@ import re
 import requests
 
 from collection_generic import run
-from common import UA
+from common import UA, secret
 
 ETATS = ["", "Neuf", "Très bon état", "Bon état", "État moyen", "Abîmé"]
 FORMATS = ["", "Broché", "Relié", "Poche", "Beau livre", "Bande dessinée", "Revue / magazine", "Partition", "Autre"]
@@ -18,8 +18,10 @@ def books_lookup(isbn):
     isbn = re.sub(r"[^\dXx]", "", isbn).upper()
     out = {}
     try:
-        r = requests.get("https://www.googleapis.com/books/v1/volumes", params={"q": f"isbn:{isbn}"}, headers=UA,
-                         timeout=20)
+        params = {"q": f"isbn:{isbn}"}
+        if secret("google", "books_api_key"):  # facultatif : évite les refus de Google depuis les serveurs Streamlit
+            params["key"] = secret("google", "books_api_key")
+        r = requests.get("https://www.googleapis.com/books/v1/volumes", params=params, headers=UA, timeout=20)
         items = r.json().get("items", []) if r.ok else []
         if items:
             v = items[0].get("volumeInfo", {})
@@ -58,6 +60,16 @@ def books_lookup(isbn):
                     out[k] = v
     except Exception:
         pass
+    if out and not out.get("resume"):  # description de l'œuvre sur Open Library, si elle existe
+        try:
+            ed = requests.get(f"https://openlibrary.org/isbn/{isbn}.json", headers=UA, timeout=20).json()
+            work = (ed.get("works") or [{}])[0].get("key")
+            if work:
+                w = requests.get(f"https://openlibrary.org{work}.json", headers=UA, timeout=20).json()
+                desc = w.get("description")
+                out["resume"] = (desc.get("value") if isinstance(desc, dict) else desc or "").strip()
+        except Exception:
+            pass
     if out:
         out["isbn"] = isbn
     return out
@@ -77,7 +89,7 @@ run({
         ("estimation_basse_eur", "Estimation basse (€)", "text"), ("estimation_haute_eur", "Estimation haute (€)", "text"),
         ("resume", "Résumé", "long"), ("notes", "Notes", "long"), ("identification_ia", "Identification IA", "long"),
     ],
-    "main": "titre", "sub": "auteur", "text_art": "le résumé", "text_field": "resume",
+    "main": "titre", "sub": "auteur", "text_art": "le résumé", "text_art_de": "du résumé", "text_field": "resume",
     "photos": [("photo_couverture", "couverture", "Couverture"), ("photo_dos", "dos", "4e de couverture (ISBN)")],
     "code_field": "isbn", "code_placeholder": "10 ou 13 chiffres, au dos près du code-barres",
     "lookup": books_lookup, "lookup_name": "Google Books / Open Library",
@@ -98,6 +110,14 @@ N'invente rien : laisse vide ce que tu ne peux pas lire ou savoir.""",
 {fiche}
 Écris en français un résumé de 4 à 6 phrases : sujet, thèmes, contexte de parution, place dans l'œuvre de l'auteur, intérêt de cette édition pour un collectionneur. Sans révéler la fin. Uniquement des faits dont tu es sûr ; si tu ne connais pas ce livre, dis-le en une phrase.
 Réponds UNIQUEMENT en JSON : {{"texte": ""}}""",
+    "complete_fields": ["resume", "genre", "estimation_basse_eur", "estimation_haute_eur"],
+    "complete_wins": ["genre"],  # Open Library donne des sujets en anglais (« Fiction, Plague ») : l'IA met le genre en français
+    "complete_prompt": """Tu es un libraire et critique littéraire. Voici la fiche d'un livre de ma bibliothèque :
+{fiche}
+Complète-la en français :
+- resume : 4 à 6 phrases (sujet, thèmes, contexte de parution, place dans l'œuvre de l'auteur), sans révéler la fin. Si une description existe déjà en anglais, traduis-la et enrichis-la. Uniquement des faits dont tu es sûr ; si tu ne connais pas le livre, dis-le en une phrase.
+- genre : un ou deux genres courts en français (ex. « Roman », « Essai, Philosophie », « Bande dessinée »).
+- estimation_basse_eur / estimation_haute_eur : prix d'occasion indicatif pour cette édition, nombre seul.""",
     "add_help": "Photographiez la couverture et la 4e de couverture, ou tapez l'ISBN : l'app retrouve l'éditeur, l'année, le nombre de pages et le résumé.",
     "filters": ["genre", "format", "lu"],
     "search_hint": "titre, auteur, éditeur, emplacement…",

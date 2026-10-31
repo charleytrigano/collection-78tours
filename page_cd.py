@@ -68,7 +68,7 @@ run({
         ("pistes", "Pistes", "long"), ("presentation", "Présentation", "long"), ("notes", "Notes", "long"),
         ("identification_ia", "Identification IA", "long"),
     ],
-    "main": "titre", "sub": "artiste", "text_art": "la présentation", "text_field": "presentation",
+    "main": "titre", "sub": "artiste", "text_art": "la présentation", "text_art_de": "de la présentation", "text_field": "presentation",
     "photos": [("photo_recto", "recto", "Pochette (recto)"), ("photo_verso", "verso", "Dos du boîtier (pistes, code-barres)")],
     "code_field": "code_barres", "code_placeholder": "13 chiffres sous le code-barres, au dos",
     "lookup": musicbrainz, "lookup_name": "MusicBrainz",
@@ -90,6 +90,13 @@ N'invente rien : laisse vide ce que tu ne peux pas lire ou savoir.""",
 {fiche}
 Écris en français une présentation de 4 à 6 phrases : contexte de sortie, style, musiciens notables, accueil, morceaux marquants, intérêt pour un collectionneur. Uniquement des faits dont tu es sûr ; si tu ne connais pas cet album, dis-le en une phrase.
 Réponds UNIQUEMENT en JSON : {{"texte": ""}}""",
+    "complete_fields": ["presentation", "genre", "estimation_basse_eur", "estimation_haute_eur"],
+    "complete_prompt": """Tu es un critique musical et disquaire. Voici la fiche d'un album de ma CDthèque :
+{fiche}
+Complète-la en français :
+- presentation : 4 à 6 phrases (contexte de sortie, style, musiciens notables, accueil, morceaux marquants). Uniquement des faits dont tu es sûr ; si tu ne connais pas l'album, dis-le en une phrase.
+- genre : un genre court en français si absent (ex. « Jazz », « Rock », « Chanson française »).
+- estimation_basse_eur / estimation_haute_eur : prix d'occasion indicatif pour ce pressage, nombre seul.""",
     "add_help": "Photographiez la pochette et le dos du boîtier, ou tapez le code-barres : l'app retrouve les pistes, le label et l'année.",
     "filters": ["genre", "format", "etat"],
     "search_hint": "artiste, album, label, morceau…",
