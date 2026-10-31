@@ -173,3 +173,90 @@ def build_catalogue(df, with_prices=True, with_photos=True, with_pres=False, tit
 
     doc.build(story, onFirstPage=lambda c, d: None, onLaterPages=footer)
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------- Catalogue générique (CD, livres)
+def _gcard(i, r, pdf, with_prices, with_photos, with_text, load_photo, width):
+    photo = _photo(load_photo(r.get(pdf["photo"])), 4.2 * cm, 5.2 * cm) if with_photos and r.get(pdf["photo"]) else None
+    meta = " · ".join(_t(r.get(k)) for k in pdf["meta"] if r.get(k))
+    small = " &nbsp;·&nbsp; ".join(_t(r.get(k)) for k in pdf.get("small", []) if r.get(k))
+    txt = [Paragraph(f"N° {i}", S["num"]),
+           Paragraph(_t(r.get(pdf["main"])) or "<i>Sans titre</i>", S["head"])]
+    if r.get(pdf["sub"]):
+        txt.append(Paragraph(_t(r.get(pdf["sub"])), S["title"]))
+    if meta:
+        txt += [Spacer(1, 2), Paragraph(meta, S["body"])]
+    if with_text and r.get(pdf["text"]):
+        t = str(r.get(pdf["text"]))
+        txt += [Spacer(1, 4), Paragraph(_t(t if len(t) < 900 else t[:900].rsplit(" ", 1)[0] + "…"), S["pres"])]
+    if small:
+        txt += [Spacer(1, 4), Paragraph(small, S["small"])]
+    if with_prices and _price(r):
+        txt += [Spacer(1, 3), Paragraph(_price(r), S["price"])]
+    if photo:
+        inner = Table([[photo, txt]], colWidths=[4.6 * cm, width - 4.6 * cm - 20])
+    else:
+        inner = Table([[txt]], colWidths=[width - 20])
+    inner.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"), ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                               ("RIGHTPADDING", (0, 0), (-1, -1), 6)]))
+    box = Table([[inner]], colWidths=[width])
+    box.setStyle(TableStyle([("BOX", (0, 0), (-1, -1), 0.6, RULE), ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                             ("RIGHTPADDING", (0, 0), (-1, -1), 10), ("TOPPADDING", (0, 0), (-1, -1), 8),
+                             ("BOTTOMPADDING", (0, 0), (-1, -1), 8)]))
+    return KeepTogether([box, Spacer(1, 0.35 * cm)])
+
+
+def _glist(df, pdf, with_prices, width):
+    cols = pdf["list_cols"]
+    head = ["N°"] + [c[1] for c in cols] + (["Estimation"] if with_prices else [])
+    data = [[Paragraph(h, S["th"]) for h in head]]
+    for i, r in enumerate(df.to_dict("records"), 1):
+        row = [str(i)] + [_t(r.get(k)) for k, _ in cols] + ([_price(r)] if with_prices else [])
+        data.append([Paragraph(x, S["td"]) for x in row])
+    fixed = 0.9 * cm + (2.4 * cm if with_prices else 0)
+    free = (width - fixed) / len(cols)
+    t = Table(data, colWidths=[0.9 * cm] + [free] * len(cols) + ([2.4 * cm] if with_prices else []), repeatRows=1)
+    t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), INK), ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                           ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, PAPER]),
+                           ("LINEBELOW", (0, 0), (-1, -1), 0.3, RULE)]))
+    return t
+
+
+def build_generic(df, pdf, with_prices=True, with_photos=True, with_text=False, title="Ma collection",
+                  load_photo=lambda path: None):
+    """Catalogue d'une collection générique. pdf : {main, sub, meta, small, text, photo, list_cols}."""
+    df = df.copy()
+    text_cols = [c for c in df.columns if not str(c).startswith("_")]
+    df[text_cols] = df[text_cols].fillna("").astype(str).replace({"nan": "", "None": ""})
+    buf = io.BytesIO()
+    margin = 1.6 * cm
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=margin, rightMargin=margin, topMargin=margin,
+                            bottomMargin=margin, title=title, author="Mes collections")
+    width = A4[0] - 2 * margin
+
+    def footer(canvas, d):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 7.5)
+        canvas.setFillColor(MUTED)
+        canvas.drawString(margin, 1 * cm, _t(title).replace("&amp;", "&"))
+        canvas.drawRightString(A4[0] - margin, 1 * cm, f"Page {d.page}")
+        canvas.restoreState()
+
+    n = len(df)
+    story = [Spacer(1, 6 * cm), Paragraph(_t(title), S["cover_title"]), Spacer(1, 0.6 * cm),
+             Paragraph(f"{n} référence{'s' if n > 1 else ''}", S["cover_sub"]),
+             Paragraph(datetime.now().strftime("Catalogue établi le %d/%m/%Y"), S["cover_sub"])]
+    if with_prices:
+        lo, hi = df["_basse"].sum(min_count=1), df["_haute"].sum(min_count=1)
+        if lo == lo and lo is not None:
+            story += [Spacer(1, 1 * cm), Paragraph(
+                f"Valeur indicative estimée : {lo:,.0f} – {hi:,.0f} €".replace(",", " "), S["cover_sub"]),
+                Paragraph("Estimations indicatives, sans valeur d'expertise.", S["small"])]
+    story.append(PageBreak())
+    if with_photos or with_text:
+        for i, r in enumerate(df.to_dict("records"), 1):
+            story.append(_gcard(i, r, pdf, with_prices, with_photos, with_text, load_photo, width))
+    else:
+        story.append(_glist(df, pdf, with_prices, width))
+    doc.build(story, onFirstPage=lambda c, d: None, onLaterPages=footer)
+    return buf.getvalue()

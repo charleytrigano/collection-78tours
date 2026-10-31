@@ -1,4 +1,4 @@
-COLLECTION 78 TOURS — DÉPLOIEMENT
+MES COLLECTIONS (78 tours · CDthèque · Bibliothèque) — DÉPLOIEMENT
 
 1. SUPABASE
 - Créez un projet sur https://supabase.com/dashboard
@@ -34,7 +34,21 @@ password = "UN_MOT_DE_PASSE_LONG_ET_UNIQUE"
 
 - Enregistrez puis redémarrez l'application.
 
-UTILISATION
+ORGANISATION
+- app.py : connexion par mot de passe et menu à gauche (78 tours, CDthèque, Bibliothèque).
+- page_78tours.py : les disques 78 tours. page_cd.py et page_livres.py : CDthèque et Bibliothèque,
+  construites sur collection_generic.py ; common.py regroupe les outils partagés (IA, photos, export).
+
+CDTHÈQUE
+- Photo de la pochette et du dos, ou code-barres : l'IA lit le boîtier et MusicBrainz complète
+  pistes, label, année, référence ; la pochette officielle est récupérée si vous n'avez pas de photo.
+- Écoutes (liens YouTube, Spotify, Deezer ou fichiers audio), présentation de l'album par l'IA.
+
+BIBLIOTHÈQUE
+- Photo de la couverture et de la 4e de couverture, ou ISBN : Google Books et Open Library complètent
+  éditeur, année, pages, résumé et couverture. Champs Lu ? / Prêté à / Emplacement.
+
+UTILISATION (78 tours)
 - Ajouter : photographiez les faces A et B (pochette facultative), cliquez « Analyser », relisez, enregistrez.
   Le formulaire se vide tout seul pour enchaîner le disque suivant. Un doublon de référence est signalé.
 - Catalogue : recherche, filtres (label, état, pochette), tri ; cliquez une ligne pour voir la fiche,
