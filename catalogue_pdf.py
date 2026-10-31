@@ -188,7 +188,7 @@ def _gcard(i, r, pdf, with_prices, with_photos, with_text, load_photo, width):
         txt += [Spacer(1, 2), Paragraph(meta, S["body"])]
     if with_text and r.get(pdf["text"]):
         t = str(r.get(pdf["text"]))
-        txt += [Spacer(1, 4), Paragraph(_t(t if len(t) < 900 else t[:900].rsplit(" ", 1)[0] + "…"), S["pres"])]
+        txt += [Spacer(1, 4), Paragraph(_t(t if len(t) < 1800 else t[:1800].rsplit(" ", 1)[0] + "…"), S["body"])]
     if small:
         txt += [Spacer(1, 4), Paragraph(small, S["small"])]
     if with_prices and _price(r):
