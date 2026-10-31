@@ -148,39 +148,62 @@ def _call(p, model, payload, provider):
                 time.sleep(max(2, wait + 1))
                 continue
             raise QuotaExhausted(detail)
-        if r.status_code >= 500 and attempt < 2:
-            time.sleep(3)
+        if r.status_code >= 500 and attempt < 1:  # une seule nouvelle tentative, puis modèle suivant
+            time.sleep(2)
             continue
         return r
     return r
 
 
-def ask_ai(provider, content, max_tokens=None):
-    """Envoie la demande au premier modèle disponible du fournisseur et renvoie le texte brut."""
+def _ask_one(provider, content):
+    """Essaie chaque modèle du fournisseur ; passe au suivant si quota épuisé, modèle absent ou serveur saturé."""
     p = AVAILABLE[provider]
     payload = {"messages": [{"role": "user", "content": content}], "temperature": 0.1, **p["extra"]}
-    skipped = []
+    skipped, reasons = [], set()
     for model in p["models"]:
         try:
             response = _call(p, model, payload, provider)
         except QuotaExhausted:
             skipped.append(model)
+            reasons.add("quota")
             continue
         if response.status_code in (400, 404) and re.search(r"model|not found|not supported", api_error(response), re.I):
             skipped.append(model)  # modèle retiré ou indisponible pour ce compte
             continue
+        if response.status_code >= 500:
+            skipped.append(model)  # « high demand » / surcharge passagère : on tente le modèle suivant
+            reasons.add("surcharge")
+            continue
         break
     else:
-        raise RuntimeError(f"Quota gratuit {provider} épuisé pour aujourd'hui sur tous les modèles "
-                           f"({', '.join(skipped)}). Il se réinitialise vers 9 h (heure de Paris)"
-                           + (", ou essayez l'autre IA." if len(AVAILABLE) > 1 else "."))
+        if reasons == {"quota"}:
+            why = "quota gratuit épuisé pour aujourd'hui (réinitialisation vers 9 h, heure de Paris)"
+        elif "surcharge" in reasons:
+            why = "serveurs saturés pour le moment, réessayez dans quelques minutes"
+        else:
+            why = "aucun modèle disponible"
+        raise RuntimeError(f"{provider} : {why} ({', '.join(skipped)}).")
     if response.status_code >= 400:
         raise RuntimeError(f"{provider} ({response.status_code}) : {api_error(response)}")
-    st.session_state.ai_model = model
+    st.session_state.ai_model = f"{provider} · {model}"
     try:
         return response.json()["choices"][0]["message"]["content"] or ""
     except (KeyError, IndexError, TypeError, ValueError):
         return response.text
+
+
+def ask_ai(provider, content, max_tokens=None):
+    """Demande à l'IA choisie ; si elle est indisponible, bascule automatiquement sur l'autre IA configurée."""
+    errors = []
+    for prov in [provider] + [x for x in AVAILABLE if x != provider]:
+        try:
+            raw = _ask_one(prov, content)
+            if prov != provider:
+                st.toast(f"{provider} indisponible : analyse faite avec {prov}.")
+            return raw
+        except RuntimeError as e:
+            errors.append(str(e))
+    raise RuntimeError(" / ".join(errors))
 
 
 
