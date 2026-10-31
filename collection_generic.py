@@ -128,6 +128,33 @@ def run(cfg):
     def lookup(code):
         return _lookup(cfg["table"], code)
 
+    def complete(provider, rec):
+        """Complète une fiche sans photo (résumé/présentation en français, genre, estimation) à partir des infos connues."""
+        keys = cfg.get("complete_fields", [cfg["text_field"], "estimation_basse_eur", "estimation_haute_eur"])
+        fiche = "\n".join(f"- {LAB[k]} : {rec.get(k)}" for k in KEYS
+                          if rec.get(k) and k not in (cfg["text_field"], "notes", "identification_ia", "pistes"))
+        if rec.get("pistes"):
+            fiche += "\n- Pistes : " + str(rec["pistes"])[:1500]
+        template = json.dumps({k: "" for k in keys}, ensure_ascii=False)
+        raw = ask_ai(provider, cfg["complete_prompt"].format(fiche=fiche) +
+                     "\nRéponds UNIQUEMENT avec ce JSON, valeurs en chaînes de caractères :\n" + template)
+        data = normalize(parse_json(raw))
+        return {k: data.get(k, "") for k in keys}
+
+    def apply_complete(provider, rec):
+        """Ajoute à la fiche ce que l'IA propose : champs vides, plus ceux qu'elle sait mieux remplir (ex. genre en français)."""
+        try:
+            with st.spinner(f"Rédaction {cfg['text_art_de']} et estimation avec {provider}…"):
+                extra = complete(provider, rec)
+        except Exception as e:
+            st.session_state[f"{P}_warn"] = f"Fiche remplie, mais l'IA n'a pas pu compléter : {e}"
+            return rec
+        out = dict(rec)
+        for k, v in extra.items():
+            if v and (not out.get(k) or k in cfg.get("complete_wins", [])):
+                out[k] = v
+        return out
+
     def merge(base, found):
         """Complète la fiche avec les données trouvées en ligne (prioritaires pour les faits, l'IA garde le reste)."""
         out = dict(base)
@@ -234,6 +261,11 @@ def run(cfg):
                 uploads.append(u)
 
         result = st.session_state.get(f"{P}_result", {})
+        provider = None
+        if len(AVAILABLE) > 1:
+            provider = st.radio("IA utilisée", list(AVAILABLE), horizontal=True, key=f"{P}_provider")
+        elif AVAILABLE:
+            provider = next(iter(AVAILABLE))
         if CODE:
             c1, c2 = st.columns([3, 1])
             with c1:
@@ -250,7 +282,10 @@ def run(cfg):
                     with st.spinner(f"Recherche sur {cfg['lookup_name']}…"):
                         found = lookup(code)
                     if found:
-                        st.session_state[f"{P}_result"] = merge({**result, CODE: code}, found)
+                        filled = merge({**result, CODE: code}, found)
+                        if provider and not filled.get(cfg["text_field"]) or provider and cfg.get("complete_wins"):
+                            filled = apply_complete(provider, filled)
+                        st.session_state[f"{P}_result"] = filled
                         st.session_state[f"{P}_cover"] = found.get("_cover")
                         st.session_state[f"{P}_round"] = st.session_state.get(f"{P}_round", 0) + 1
                         st.rerun()
@@ -260,13 +295,19 @@ def run(cfg):
                 except Exception as e:
                     st.error(f"Recherche impossible : {e}")
 
-        provider = None
-        if len(AVAILABLE) > 1:
-            provider = st.radio("IA utilisée", list(AVAILABLE), horizontal=True, key=f"{P}_provider")
-        elif AVAILABLE:
-            provider = next(iter(AVAILABLE))
-        if st.button("🤖 Analyser les photos avec l'IA", type="primary", key=f"{P}_ai_{n}",
-                     disabled=not (provider and any(uploads))):
+        has_photo, has_info = any(uploads), bool((result.get(cfg["main"]) or "").strip())
+        ai_label = ("🤖 Analyser les photos avec l'IA" if has_photo else
+                    f"🤖 Compléter la fiche avec l'IA ({cfg['text_art']}, estimation)")
+        if st.session_state.get(f"{P}_warn"):
+            st.warning(st.session_state.pop(f"{P}_warn"))
+        if provider and not has_photo and not has_info:
+            st.caption("Ajoutez une photo, ou faites d'abord la recherche en ligne, pour activer l'IA.")
+        if st.button(ai_label, type="primary", key=f"{P}_ai_{n}",
+                     disabled=not (provider and (has_photo or has_info))):
+            if not has_photo:
+                st.session_state[f"{P}_result"] = apply_complete(provider, result)
+                st.session_state[f"{P}_round"] = st.session_state.get(f"{P}_round", 0) + 1
+                st.rerun()
             try:
                 with st.spinner(f"Analyse avec {provider}…"):
                     res = identify(provider, uploads)
