@@ -40,6 +40,19 @@ COMPTES UTILISATEURS
   administrateur ; toutes les fiches existantes lui sont rattachées. [app] password ne sert qu'à ça.
 - Comptes sur invitation : l'administrateur les crée dans la page « 👥 Utilisateurs »
   (mot de passe provisoire, réinitialisation, suppression). Chacun change son mot de passe dans « Mon compte ».
+- Invitations par e-mail : ajoutez dans les Secrets l'adresse de l'app et un serveur d'envoi.
+  Gmail (compte avec validation en deux étapes + « mot de passe d'application ») :
+    [app]
+    url = "https://VOTRE-APP.streamlit.app"
+    [smtp]
+    server = "smtp.gmail.com"
+    port = 465
+    user = "votre.adresse@gmail.com"
+    password = "MOT_DE_PASSE_D_APPLICATION_16_LETTRES"
+    sender_name = "Mes collections"
+  Autres services possibles : Brevo (smtp-relay.brevo.com, port 587), OVH, Infomaniak…
+  Les invités reçoivent un mot de passe provisoire à changer à la première connexion ;
+  « Mot de passe oublié ? » envoie un mot de passe provisoire (au plus un par quart d'heure).
 - Conseillé : dans Supabase > Authentication > Sign In / Providers, désactivez « Allow new users to sign up ».
 - Les clés IA (Gemini, Groq) sont partagées : leurs quotas sont communs à tous les utilisateurs.
 

@@ -36,7 +36,8 @@ def _fresh_client():
 
 def _as_dict(user):
     meta = getattr(user, "app_metadata", None) or {}
-    return {"id": str(user.id), "email": user.email, "admin": meta.get("role") == "admin"}
+    return {"id": str(user.id), "email": user.email, "admin": meta.get("role") == "admin",
+            "must_change": bool(meta.get("must_change"))}
 
 
 def check_password(email, password):
@@ -53,19 +54,51 @@ def list_users():
     return sorted(users, key=lambda u: (u.email or "").lower())
 
 
-def create_user(email, password, admin=False):
+def create_user(email, password, admin=False, must_change=True):
+    """Crée un compte ; par défaut le mot de passe est provisoire et devra être changé à la première connexion."""
     res = admin_client().auth.admin.create_user({
         "email": email.strip().lower(), "password": password, "email_confirm": True,
-        "app_metadata": {"role": "admin" if admin else "user"}})
+        "app_metadata": {"role": "admin" if admin else "user", "must_change": must_change}})
     return res.user
 
 
-def set_password(uid, password):
+def _meta(uid):
+    try:
+        return dict(admin_client().auth.admin.get_user_by_id(uid).user.app_metadata or {})
+    except Exception:
+        return {}
+
+
+def _update_meta(uid, **changes):
+    meta = _meta(uid)
+    meta.update(changes)
+    admin_client().auth.admin.update_user_by_id(uid, {"app_metadata": meta})
+
+
+def set_password(uid, password, must_change=None):
     admin_client().auth.admin.update_user_by_id(uid, {"password": password})
+    if must_change is not None:
+        _update_meta(uid, must_change=must_change)
 
 
 def set_admin(uid, admin):
-    admin_client().auth.admin.update_user_by_id(uid, {"app_metadata": {"role": "admin" if admin else "user"}})
+    _update_meta(uid, role="admin" if admin else "user")
+
+
+def forgot_password(email):
+    """Envoie un mot de passe provisoire si le compte existe (au plus une fois par quart d'heure et par compte)."""
+    import mailer
+    email = email.strip().lower()
+    user = next((u for u in list_users() if (u.email or "").lower() == email), None)
+    if not user or not mailer.configured():
+        return
+    meta = dict(user.app_metadata or {})
+    if time.time() - float(meta.get("last_reset", 0)) < 900:
+        return
+    pw = suggest_password()
+    admin_client().auth.admin.update_user_by_id(str(user.id), {"password": pw})
+    _update_meta(str(user.id), must_change=True, last_reset=time.time())
+    mailer.send_new_password(email, pw, reason="forgot")
 
 
 def delete_user(uid):
@@ -132,7 +165,7 @@ def _bootstrap():
         st.error(problem)
         return
     try:
-        user = create_user(email, pw, admin=True)
+        user = create_user(email, pw, admin=True, must_change=False)
         sb = admin_client()
         for table in TABLES:
             sb.table(table).update({"owner_id": str(user.id)}).is_("owner_id", "null").execute()
@@ -169,5 +202,20 @@ def login_gate():
             st.rerun()
         time.sleep(1)  # freine les essais en rafale
         st.error("E-mail ou mot de passe incorrect.")
-    st.caption("Pas encore de compte ou mot de passe oublié ? Demandez à l'administrateur de l'application.")
+    import mailer
+    if mailer.configured():
+        with st.expander("Mot de passe oublié ?"):
+            with st.form("forgot", clear_on_submit=True):
+                f_email = st.text_input("Votre e-mail")
+                sent = st.form_submit_button("Recevoir un mot de passe provisoire")
+            if sent:
+                try:
+                    forgot_password(f_email)
+                except Exception:
+                    pass
+                # même réponse que le compte existe ou non : on ne révèle pas qui est inscrit
+                st.success("Si un compte existe pour cette adresse, un e-mail vient de lui être envoyé.")
+        st.caption("Pas encore de compte ? Demandez une invitation à l'administrateur.")
+    else:
+        st.caption("Pas encore de compte ou mot de passe oublié ? Demandez à l'administrateur de l'application.")
     st.stop()
