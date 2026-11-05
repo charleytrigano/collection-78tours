@@ -10,7 +10,7 @@ import requests
 import streamlit as st
 
 from common import (AVAILABLE, BUCKET, IMG_TYPES, UA, ask_ai, clean_url, db, ecoutes, flatten, fmt_eur, euro_number,
-                    img_data_url, jpg_bytes, kind_of, parse_json, play, price_bounds, signed_url, to_excel,
+                    current_uid, img_data_url, jpg_bytes, kind_of, parse_json, play, price_bounds, signed_url, to_excel,
                     year_number)
 
 AUDIO_TYPES = ["mp3", "wav", "m4a", "ogg", "flac", "aac"]
@@ -27,6 +27,7 @@ class _Bytes:
 
 def run(cfg):
     P = cfg["prefix"]
+    UID = current_uid()
     F = cfg["fields"]                      # [(clé, libellé, type, options)]
     KEYS = [f[0] for f in F]
     LAB = {f[0]: f[1] for f in F} | {"created_at": "Date d'ajout", "Écoutes": "Écoutes"}
@@ -37,15 +38,15 @@ def run(cfg):
     sb = db()
 
     @st.cache_data(ttl=300, show_spinner=False)
-    def load(table):
-        return db().table(table).select("*").order("created_at", desc=True).execute().data or []
+    def load(table, uid):  # l'utilisateur fait partie de la clé de cache
+        return db().table(table).select("*").eq("owner_id", uid).order("created_at", desc=True).execute().data or []
 
     def refresh():
         load.clear()
         st.rerun()
 
     try:
-        records = load(cfg["table"])
+        records = load(cfg["table"], UID)
     except Exception as e:
         st.error(f"Table « {cfg['table']} » inaccessible. Exécutez supabase_schema.sql dans Supabase.")
         st.code(str(e))
@@ -190,7 +191,7 @@ def run(cfg):
     # ------------------------------------------------------------ Écoutes (CD)
     def save_ecoutes(rid, items, msg):
         sb.table(cfg["table"]).update({"ecoutes": json.dumps(items, ensure_ascii=False) if items else None}) \
-            .eq("id", rid).execute()
+            .eq("id", rid).eq("owner_id", UID).execute()
         st.toast(msg)
         refresh()
 
@@ -229,7 +230,7 @@ def run(cfg):
             up = st.file_uploader("Ou déposez un fichier audio", type=AUDIO_TYPES, key=f"{P}_aud_{rid}")
             if up and st.button("💾 Enregistrer ce fichier", key=f"{P}_audb_{rid}"):
                 ext = up.name.rsplit(".", 1)[-1].lower()
-                path = f"{P}/{rid}/audio_{uuid.uuid4().hex[:6]}.{ext}"
+                path = f"{UID}/{P}/{rid}/audio_{uuid.uuid4().hex[:6]}.{ext}"
                 sb.storage.from_(BUCKET).upload(path, up.getvalue(), {"content-type": up.type or f"audio/{ext}",
                                                                       "upsert": "true"})
                 save_ecoutes(rid, items + [{"url": path, "nom": up.name.rsplit(".", 1)[0]}], "Fichier ajouté.")
@@ -348,18 +349,18 @@ def run(cfg):
                 try:
                     with st.spinner("Enregistrement…"):
                         rid = str(uuid.uuid4())
-                        row = {"id": rid, "created_at": datetime.now().astimezone().isoformat(),
+                        row = {"id": rid, "owner_id": UID, "created_at": datetime.now().astimezone().isoformat(),
                                **{k: (v.strip() if isinstance(v, str) else v) for k, v in vals.items()}}
                         for (col, fname, _), u in zip(PHOTOS, uploads):
                             if u:
-                                row[col] = f"{P}/{rid}/{fname}.jpg"
+                                row[col] = f"{UID}/{P}/{rid}/{fname}.jpg"
                                 upload_photo(row[col], u)
                         cover = st.session_state.get(f"{P}_cover")
                         if cover and not uploads[0]:
                             try:
                                 r = requests.get(cover, headers=UA, timeout=20)
                                 if r.ok and len(r.content) > 2000:
-                                    path = f"{P}/{rid}/{PHOTOS[0][1]}.jpg"
+                                    path = f"{UID}/{P}/{rid}/{PHOTOS[0][1]}.jpg"
                                     upload_photo(path, _Bytes(r.content))
                                     row[PHOTOS[0][0]] = path  # seulement si l'image a bien été stockée
                             except Exception:
@@ -446,7 +447,7 @@ def run(cfg):
                             with st.spinner(f"Rédaction avec {prov}…"):
                                 txt = present(prov, rec)
                             if txt:
-                                sb.table(cfg["table"]).update({tf: txt}).eq("id", rid).execute()
+                                sb.table(cfg["table"]).update({tf: txt}).eq("id", rid).eq("owner_id", UID).execute()
                                 refresh()
                             st.warning("L'IA n'a rien pu écrire.")
                         except Exception as e:
@@ -471,11 +472,11 @@ def run(cfg):
                             upd = {k: (v.strip() if isinstance(v, str) else v) for k, v in ev.items()}
                             for col, fname, _ in PHOTOS:
                                 if newp[col]:
-                                    path = rec.get(col) or f"{P}/{rid}/{fname}.jpg"
+                                    path = rec.get(col) or f"{UID}/{P}/{rid}/{fname}.jpg"
                                     upload_photo(path, newp[col])
                                     upd[col] = path
                                     signed_url.clear()
-                            sb.table(cfg["table"]).update(upd).eq("id", rid).execute()
+                            sb.table(cfg["table"]).update(upd).eq("id", rid).eq("owner_id", UID).execute()
                             st.toast("Modifications enregistrées.")
                             refresh()
                         except Exception as e:
@@ -491,7 +492,7 @@ def run(cfg):
                                     sb.storage.from_(BUCKET).remove(paths)
                                 except Exception:
                                     pass
-                            sb.table(cfg["table"]).delete().eq("id", rid).execute()
+                            sb.table(cfg["table"]).delete().eq("id", rid).eq("owner_id", UID).execute()
                             st.toast("Fiche supprimée.")
                             refresh()
                         except Exception as e:

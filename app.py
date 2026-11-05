@@ -1,40 +1,24 @@
-"""Point d'entrée : connexion par mot de passe puis menu des collections."""
-import hmac
-import time
-
+"""Point d'entrée : connexion par compte puis menu des collections."""
 import streamlit as st
+
+from auth import login_gate
 
 st.set_page_config(page_title="Mes collections", page_icon="🗂️", layout="wide")
 
+user = login_gate()
 
-def secret(section, key, default=""):
-    try:
-        return st.secrets[section][key]
-    except Exception:
-        return default
-
-
-password = secret("app", "password")
-if not password:
-    st.error("Configuration manquante : ajoutez [app] password dans les Secrets Streamlit.")
-    st.stop()
-if not st.session_state.get("auth_ok"):
-    st.title("🗂️ Mes collections")
-    st.caption("78 tours · CDthèque · Bibliothèque")
-    with st.form("login"):
-        entered = st.text_input("Mot de passe", type="password")
-        ok = st.form_submit_button("Se connecter", type="primary")
-    if ok:
-        if hmac.compare_digest(entered.encode(), str(password).encode()):
-            st.session_state.auth_ok = True
-            st.rerun()
-        time.sleep(1)  # freine les essais en rafale
-        st.error("Mot de passe incorrect.")
-    st.stop()
-
-pages = [
-    st.Page("page_78tours.py", title="Disques 78 tours", icon="💿", url_path="78-tours", default=True),
-    st.Page("page_cd.py", title="CDthèque", icon="📀", url_path="cdtheque"),
-    st.Page("page_livres.py", title="Bibliothèque", icon="📚", url_path="bibliotheque"),
-]
+pages = {
+    "Mes collections": [
+        st.Page("page_78tours.py", title="Disques 78 tours", icon="💿", url_path="78-tours", default=True),
+        st.Page("page_cd.py", title="CDthèque", icon="📀", url_path="cdtheque"),
+        st.Page("page_livres.py", title="Bibliothèque", icon="📚", url_path="bibliotheque"),
+    ],
+    "Compte": [st.Page("page_compte.py", title="Mon compte", icon="👤", url_path="compte")]
+    + ([st.Page("page_utilisateurs.py", title="Utilisateurs", icon="👥", url_path="utilisateurs")] if user["admin"] else []),
+}
+with st.sidebar:
+    st.caption(f"Connecté : **{user['email']}**" + (" · administrateur" if user["admin"] else ""))
+    if st.button("Se déconnecter", key="logout_sidebar"):
+        st.session_state.clear()
+        st.rerun()
 st.navigation(pages).run()
