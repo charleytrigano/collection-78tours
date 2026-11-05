@@ -34,8 +34,17 @@ password = "UN_MOT_DE_PASSE_LONG_ET_UNIQUE"
 
 - Enregistrez puis redémarrez l'application.
 
+COMPTES UTILISATEURS
+- Connexion par e-mail + mot de passe (Supabase Auth). Chaque compte a ses propres collections.
+- Premier lancement : l'app demande l'ancien mot de passe ([app] password) pour créer le compte
+  administrateur ; toutes les fiches existantes lui sont rattachées. [app] password ne sert qu'à ça.
+- Comptes sur invitation : l'administrateur les crée dans la page « 👥 Utilisateurs »
+  (mot de passe provisoire, réinitialisation, suppression). Chacun change son mot de passe dans « Mon compte ».
+- Conseillé : dans Supabase > Authentication > Sign In / Providers, désactivez « Allow new users to sign up ».
+- Les clés IA (Gemini, Groq) sont partagées : leurs quotas sont communs à tous les utilisateurs.
+
 ORGANISATION
-- app.py : connexion par mot de passe et menu à gauche (78 tours, CDthèque, Bibliothèque).
+- app.py : connexion (auth.py) et menu à gauche ; page_compte.py, page_utilisateurs.py ; (78 tours, CDthèque, Bibliothèque).
 - page_78tours.py : les disques 78 tours. page_cd.py et page_livres.py : CDthèque et Bibliothèque,
   construites sur collection_generic.py ; common.py regroupe les outils partagés (IA, photos, export).
 

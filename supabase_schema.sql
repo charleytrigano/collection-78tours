@@ -39,3 +39,11 @@ create table if not exists public.livres (
  photo_couverture text, photo_dos text
 );
 alter table public.livres enable row level security;
+
+-- Plusieurs utilisateurs : chaque fiche appartient à un compte (Supabase Auth)
+alter table public.disques add column if not exists owner_id uuid;
+alter table public.cds add column if not exists owner_id uuid;
+alter table public.livres add column if not exists owner_id uuid;
+create index if not exists disques_owner_idx on public.disques(owner_id);
+create index if not exists cds_owner_idx on public.cds(owner_id);
+create index if not exists livres_owner_idx on public.livres(owner_id);

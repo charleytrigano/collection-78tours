@@ -301,3 +301,16 @@ def price_bounds(lo, hi):
 
 def img_data_url(upload, size=2000):
     return "data:image/jpeg;base64," + base64.b64encode(jpg_bytes(upload, size)).decode("ascii")
+
+
+def current_user():
+    """Utilisateur connecté (dict id, email, admin) ; arrête la page si personne n'est connecté."""
+    user = st.session_state.get("user")
+    if not user or not user.get("id"):
+        st.error("Session expirée : reconnectez-vous.")
+        st.stop()
+    return user
+
+
+def current_uid():
+    return current_user()["id"]

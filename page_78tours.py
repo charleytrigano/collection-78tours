@@ -39,14 +39,19 @@ def secret(section, key, default=""):
         return default
 
 
+from common import current_uid
+
+UID = current_uid()
+
+
 @st.cache_resource
 def db():
     return create_client(secret("supabase", "url"), secret("supabase", "service_role_key"))
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_records():
-    return db().table("disques").select("*").order("created_at", desc=True).execute().data or []
+def load_records(uid):  # l'utilisateur fait partie de la clé de cache : personne ne voit le cache d'un autre
+    return db().table("disques").select("*").eq("owner_id", uid).order("created_at", desc=True).execute().data or []
 
 
 def refresh():
@@ -56,7 +61,7 @@ def refresh():
 
 try:
     sb = db()
-    records = load_records()
+    records = load_records(UID)
 except Exception as e:
     st.error("Connexion Supabase impossible. Vérifiez les Secrets et exécutez supabase_schema.sql.")
     st.code(str(e))
@@ -516,7 +521,7 @@ def play(item, height=None):
 
 def save_ecoutes(cid, side, items, msg):
     sb.table("disques").update({f"ecoute_face_{side}": json.dumps(items, ensure_ascii=False) if items else None}) \
-        .eq("id", cid).execute()
+        .eq("id", cid).eq("owner_id", UID).execute()
     st.toast(msg)
     refresh()
 
@@ -579,7 +584,7 @@ def ecoute_panel(rec, side):
         if up and st.button("💾 Enregistrer ce fichier", key=f"audb_{cid}_{side}"):
             try:
                 ext = up.name.rsplit(".", 1)[-1].lower()
-                path = f"{cid}/audio_face_{side}_{uuid.uuid4().hex[:6]}.{ext}"
+                path = f"{UID}/{cid}/audio_face_{side}_{uuid.uuid4().hex[:6]}.{ext}"
                 sb.storage.from_(BUCKET).upload(path, up.getvalue(), {"content-type": up.type or f"audio/{ext}",
                                                                       "upsert": "true"})
                 add_ecoute(rec, side, path, up.name.rsplit(".", 1)[0])
@@ -681,13 +686,13 @@ with tabs[0]:
             try:
                 with st.spinner("Enregistrement…"):
                     did = str(uuid.uuid4())
-                    paths = {"photo_etiquette": f"{did}/etiquette.jpg", "photo_face_b": f"{did}/face_b.jpg",
-                             "photo_pochette": f"{did}/pochette.jpg" if cover_photo else None}
+                    paths = {"photo_etiquette": f"{UID}/{did}/etiquette.jpg", "photo_face_b": f"{UID}/{did}/face_b.jpg",
+                             "photo_pochette": f"{UID}/{did}/pochette.jpg" if cover_photo else None}
                     upload_photo(paths["photo_etiquette"], face_a_photo)
                     upload_photo(paths["photo_face_b"], face_b_photo)
                     if cover_photo:
                         upload_photo(paths["photo_pochette"], cover_photo)
-                    row = {"id": did, "created_at": datetime.now().astimezone().isoformat(),
+                    row = {"id": did, "owner_id": UID, "created_at": datetime.now().astimezone().isoformat(),
                            **{k: v.strip() for k, v in vals.items()}, "etat": state, "pochette": cover, **paths}
                     sb.table("disques").insert(row).execute()
                 for k in ("ai_result", "ai_sig"):
@@ -790,7 +795,7 @@ with tabs[1]:
                         if not any(pres.values()):
                             st.warning("L'IA n'a rien pu dire sur ces morceaux.")
                         else:
-                            sb.table("disques").update(pres).eq("id", cid).execute()
+                            sb.table("disques").update(pres).eq("id", cid).eq("owner_id", UID).execute()
                             refresh()
                     except Exception as e:
                         st.error(f"Présentation impossible : {e}")
@@ -823,11 +828,11 @@ with tabs[1]:
                         upd = {k: v.strip() for k, v in edit_vals.items()} | {"etat": edit_etat, "pochette": edit_poch}
                         for key, fname, _ in PHOTOS:
                             if new_photos[key]:
-                                path = chosen.get(key) or f"{cid}/{fname}.jpg"
+                                path = chosen.get(key) or f"{UID}/{cid}/{fname}.jpg"
                                 upload_photo(path, new_photos[key])
                                 upd[key] = path
                                 signed_url.clear()
-                        sb.table("disques").update(upd).eq("id", cid).execute()
+                        sb.table("disques").update(upd).eq("id", cid).eq("owner_id", UID).execute()
                         st.toast("Modifications enregistrées.")
                         refresh()
                     except Exception as e:
@@ -846,7 +851,7 @@ with tabs[1]:
                                 sb.storage.from_(BUCKET).remove(paths)
                             except Exception:
                                 pass
-                        sb.table("disques").delete().eq("id", cid).execute()
+                        sb.table("disques").delete().eq("id", cid).eq("owner_id", UID).execute()
                         st.toast("Disque supprimé.")
                         refresh()
                     except Exception as e:
